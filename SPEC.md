@@ -1,10 +1,10 @@
 # ZK API Usage Credits
 
-This note describes a simplified client-server variant of ZK API usage credits.
+This note describes a ZK API usage credits protocol.
 
-The goal is the same as before: a user deposits funds on-chain once, and then makes many anonymous off-chain API requests. The server must be protected against replay and non-payment, while honest users remain unlinkable.
+The goal is: a user deposits funds on-chain once, and then makes many anonymous off-chain API requests. The server must be protected against replay and non-payment, while honest users remain unlinkable.
 
-Compared to the original RLN-based design, this version removes:
+Compared to the original [RLN-based design](https://ethresear.ch/t/zk-api-usage-credits-llms-and-beyond/24104), this version removes:
 - the "two points on a line" construction,
 - ticket indices,
 - growing refund histories.
