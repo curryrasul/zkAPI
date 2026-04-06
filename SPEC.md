@@ -484,6 +484,7 @@ The shared Rust types and Solidity `Types.sol` file must define these structs ex
 
 ```text
 struct RequestPublicInputs {
+  uint8 statementType;
   uint16 protocolVersion;
   uint64 chainId;
   address contractAddress;
@@ -502,6 +503,7 @@ struct RequestPublicInputs {
 
 ```text
 struct WithdrawalPublicInputs {
+  uint8 statementType;
   uint16 protocolVersion;
   uint64 chainId;
   address contractAddress;
@@ -521,6 +523,8 @@ struct WithdrawalPublicInputs {
 
 The Cairo public outputs must map to these structs field-for-field.
 The adapter must reject any proof whose decoded public outputs do not match the struct values exactly.
+For request proofs, `stateSigEpoch == 0` and `stateSigRoot == 0` is the canonical encoding of the genesis path.
+This is the request-proof equivalent of `isGenesis == true`.
 
 ## 6. Solidity Contract
 
@@ -535,6 +539,12 @@ One deployed contract instance manages:
 - one active-root tree;
 - one set of server signing roots by epoch;
 - one proof-adapter contract.
+
+The contract must use:
+
+- `ReentrancyGuard` or an equivalent non-reentrancy mechanism on every external state-mutating entrypoint;
+- safe ERC20 transfer helpers;
+- checks-effects-interactions ordering for all payout paths.
 
 ## 6.2 Immutable and Configurable Parameters
 
@@ -559,6 +569,38 @@ Owner-controlled, but rarely changed:
 
 The contract must be non-upgradeable in v1.
 
+## 6.2.1 XMSS Epoch Lifecycle
+
+XMSS roots are append-only in v1.
+
+Rules:
+
+- `rotateServerRoots` publishes a new epoch and makes it the epoch used for all newly issued state signatures and clearance signatures;
+- old epochs remain valid for verification indefinitely in v1;
+- the contract must reject re-registration of an existing epoch number;
+- epoch numbers must increase strictly monotonically;
+- the server must not issue signatures against an epoch until that epoch is visible on-chain;
+- the server must rotate to a new epoch before exhausting the current XMSS tree;
+- if the current signing tree is exhausted and no new epoch is published yet, the server must reject new work with `capacity_exhausted`;
+- there is no protocol-level maximum number of retained verification epochs in v1;
+- there is no revocation or deactivation flow in v1.
+
+Rationale:
+
+- previously issued states and clearances may need to be verified long after issuance;
+- append-only epochs avoid breaking in-flight requests or already issued wallet states during rotation.
+
+Client discovery rules:
+
+- the server may advertise the latest epoch through an API or config endpoint;
+- the client must treat on-chain epoch roots as authoritative;
+- when a server response references an unknown epoch, the client must fetch that epoch root from chain or indexer before accepting the state.
+
+Operational rule:
+
+- in-flight requests are not invalidated by epoch rotation, because the request proof does not commit to the future epoch used for the returned next state;
+- the returned next state may be signed under any on-chain published current epoch.
+
 ## 6.3 Public Functions
 
 Required contract functions:
@@ -579,7 +621,10 @@ unpause()
 
 `deposit`:
 
+- is `nonReentrant`;
 - requires `amount > 0`;
+- requires `commitment != 0`;
+- requires `commitment < STARK_FIELD_PRIME`;
 - transfers ERC20 from caller into the vault;
 - allocates `note_id = nextNoteId`;
 - computes `expiry = block.timestamp + noteTtl`;
@@ -591,6 +636,8 @@ unpause()
 `mutualClose`:
 
 - verifies withdrawal proof via adapter;
+- is `nonReentrant`;
+- requires `inputs.statementType == 2`;
 - requires `inputs.hasClearance = true`;
 - requires `inputs.activeRoot == currentRoot`;
 - requires `stateSigRootByEpoch[inputs.stateSigEpoch] == inputs.stateSigRoot` when `inputs.isGenesis = false`;
@@ -605,6 +652,8 @@ unpause()
 `initiateEscapeWithdrawal`:
 
 - verifies withdrawal proof via adapter;
+- is `nonReentrant`;
+- requires `inputs.statementType == 2`;
 - requires `inputs.hasClearance = false`;
 - requires `inputs.activeRoot == currentRoot`;
 - requires `stateSigRootByEpoch[inputs.stateSigEpoch] == inputs.stateSigRoot` when `inputs.isGenesis = false`;
@@ -618,8 +667,10 @@ unpause()
 `challengeEscapeWithdrawal`:
 
 - requires note status `PendingWithdrawal`;
+- is `nonReentrant`;
 - requires current time < `challengeDeadline`;
 - verifies request proof via adapter;
+- requires `inputs.statementType == 1`;
 - requires `stateSigRootByEpoch[inputs.stateSigEpoch] == inputs.stateSigRoot` when `inputs.stateSigEpoch != 0`;
 - requires `inputs.requestNullifier == pending.withdrawalNullifier`;
 - requires the current root has zero at the note leaf index;
@@ -630,6 +681,7 @@ unpause()
 `finalizeEscapeWithdrawal`:
 
 - requires note status `PendingWithdrawal`;
+- is `nonReentrant`;
 - requires current time >= `challengeDeadline`;
 - clears pending withdrawal data;
 - marks note status `Closed`;
@@ -638,10 +690,23 @@ unpause()
 `claimExpired`:
 
 - requires note status `Active`;
+- is `nonReentrant`;
 - requires `block.timestamp >= expiryTs`;
 - zeroes the note leaf;
 - marks note status `Closed`;
 - transfers the full deposit amount to treasury.
+
+Root freshness rule:
+
+- v1 accepts only `currentRoot` for deposit, mutual close, escape withdrawal initiation, challenge restore, and expiry claim;
+- any prior-root transaction that lands after another root-changing transaction must revert and be retried against the new root;
+- this is an intentional simplicity trade-off in v1;
+- accepting a bounded window of recent roots is a future optimization and out of scope for this spec.
+
+Mutual-close retry rule:
+
+- a root mismatch after clearance issuance does not consume the clearance proof path permanently;
+- the user may fetch the new root and Merkle path, rebuild the withdrawal proof, and reuse the same clearance signature, because the clearance signature binds only the withdrawal nullifier and chain context, not the active root.
 
 ## 6.4 Events
 
@@ -691,6 +756,9 @@ The adapter is responsible for:
 - verifying an inline proof or checking a registered fact;
 - pinning the allowed Cairo program hash for request proofs;
 - pinning the allowed Cairo program hash for withdrawal proofs;
+- checking the expected `statementType`:
+  - `1` for `assertValidRequest`
+  - `2` for `assertValidWithdrawal`
 - rejecting mismatched public-input layouts.
 
 ## 7.2 Required Adapters
@@ -755,6 +823,9 @@ The request program must emit these public outputs in this exact order:
 10. `anon_commitment_y`
 11. `expiry_ts`
 12. `solvency_bound`
+
+`note_id` is intentionally omitted from request public outputs to preserve request-side privacy.
+It is only revealed in the withdrawal program because on-chain settlement and Merkle leaf mutation require the note index.
 
 ### Private Witness
 
@@ -943,9 +1014,11 @@ For every request, the server must check:
 5. `solvency_bound` matches server config:
    - `requestChargeCap` if policy disabled
    - `policyChargeCap` if policy enabled
-6. if `state_sig_epoch != 0`, `state_sig_root` equals the configured root for that epoch
-7. the Cairo request proof verifies
-8. `request_nullifier` is absent from `spent_nullifiers`
+6. `statementType == 1`
+7. if `state_sig_epoch != 0`, `state_sig_root` equals the configured root for that epoch
+8. if `state_sig_epoch == 0`, `state_sig_root == 0`
+9. the Cairo request proof verifies
+10. `request_nullifier` is absent from `spent_nullifiers`
 
 The server must reject stale-root proofs even if the proof itself is valid.
 
@@ -961,18 +1034,22 @@ Use this exact high-level order:
    - otherwise reject as replay
 5. execute the provider call
 6. compute `chargeApplied`
-7. compute `nextBalance = currentBalance - chargeApplied` on the client side only; the server never learns `currentBalance`
-8. derive `nextAnchor`
-9. derive `blindDeltaSrv`
-10. compute:
+7. enforce:
+   - `chargeApplied >= 0`
+   - `chargeApplied <= requestChargeCap` for ordinary requests
+   - `chargeApplied <= policyChargeCap` for policy rejections
+8. compute `nextBalance = currentBalance - chargeApplied` on the client side only; the server never learns `currentBalance`
+9. derive `nextAnchor`
+10. derive `blindDeltaSrv`
+11. compute:
 
 ```text
 nextCommitment = anonCommitment - chargeApplied * G_balance + blindDeltaSrv * H_blind
 ```
 
-11. sign `m_state(nextCommitment, nextAnchor)` with the current state-signing XMSS tree
-12. persist the full finalized transcript atomically
-13. return the response payload plus next state
+12. sign `m_state(nextCommitment, nextAnchor)` with the current state-signing XMSS tree
+13. persist the full finalized transcript atomically
+14. return the response payload plus next state
 
 If the provider rejects on policy grounds:
 
@@ -983,6 +1060,12 @@ If the request fails due to the server's own fault:
 
 - the server must charge `0`;
 - it must still return or later recover a valid next state so the user is not stuck.
+
+Provider idempotency rule:
+
+- every provider execution must be keyed by `clientRequestId`;
+- the server must pass `clientRequestId` through as an idempotency key whenever the downstream API supports one;
+- if the downstream API does not support idempotency, that integration is not compliant with v1 for billable mutations.
 
 ## 9.4 Next Anchor Derivation
 
@@ -1021,10 +1104,11 @@ Zero is allowed.
 
 ## 9.6 Server Response Format
 
-The request response must include:
+Successful request responses must include:
 
 ```text
 {
+  status: "ok",
   client_request_id,
   request_nullifier,
   response_code,
@@ -1047,6 +1131,36 @@ The client must verify:
 - the XMSS signature on the returned state;
 - the charge bound;
 - the protocol version and chain context.
+
+Error responses must use this envelope:
+
+```text
+{
+  status: "error",
+  client_request_id,
+  error_code,
+  error_message,
+  retriable,
+  optional latest_root,
+  optional server_time_ms
+}
+```
+
+Required error codes:
+
+- `invalid_proof`
+- `stale_root`
+- `replay`
+- `note_expired`
+- `internal_error`
+- `capacity_exhausted`
+
+Error rules:
+
+- `stale_root` must include `latest_root`;
+- `replay` must set `retriable = false`;
+- `internal_error` should set `retriable = true` unless the server knows the note is permanently stuck;
+- if a finalized transcript already exists for the same `(clientRequestId, payloadHash)`, the server should return the stored success response instead of an error.
 
 ## 9.7 Clearance API
 
@@ -1085,6 +1199,18 @@ Both endpoints return:
 
 The client uses these endpoints after a crash or network timeout.
 
+Reserved-state recovery rule:
+
+- on restart, the server must scan all nullifiers still marked `Reserved`;
+- for each reserved entry, the server must use `clientRequestId` to query or replay the downstream provider idempotently;
+- if the downstream outcome is known, the server must finalize the original transcript deterministically;
+- if the downstream outcome remains unknown beyond an operator-configured recovery timeout, the server must finalize the request with:
+  - `chargeApplied = 0`
+  - an `internal_error` response
+  - a valid next state transition
+
+This prevents `Reserved` entries from remaining stuck indefinitely.
+
 ## 9.9 Challenge Watcher
 
 The server must run a watcher that listens for:
@@ -1115,6 +1241,7 @@ The client SDK is responsible for:
 - generating `secret_s`;
 - building deposits and note state;
 - tracking the latest root and sibling path;
+- fetching and validating server XMSS roots against on-chain state;
 - generating Cairo request proofs;
 - generating Cairo withdrawal proofs;
 - verifying server responses;
@@ -1154,6 +1281,7 @@ The request flow is:
 8. verify server response:
    - `chargeApplied <= configured cap`
    - `nextCommitment` algebra is correct
+   - the referenced `next_state_sig_epoch` exists on-chain
    - returned state signature verifies
 9. compute:
 
@@ -1175,6 +1303,7 @@ On startup, if `PendingRequestJournal.exists = true`, the client must:
 4. if unknown, surface an unrecoverable operator error and stop further spending from that note until resolved
 
 The client must never blindly retry the same logical request with a new proof if a pending journal exists.
+If the original failure was `stale_root`, the client may discard the failed proof, refresh the root and path, and generate a fresh proof because the nullifier was never reserved successfully.
 
 ## 10.5 Withdrawal Flow
 
@@ -1185,6 +1314,13 @@ Mutual-close flow:
 3. sync latest root and Merkle path
 4. build withdrawal proof with `has_clearance = true`
 5. submit `mutualClose`
+
+If `mutualClose` reverts due to a root mismatch:
+
+1. keep the same clearance signature
+2. refresh the latest root and Merkle path
+3. rebuild the withdrawal proof
+4. retry `mutualClose`
 
 Escape-hatch flow:
 
@@ -1325,6 +1461,8 @@ Must cover:
 The implementation must enforce these rules explicitly:
 
 - latest active root only for request proofs;
+- external state-mutating Solidity entrypoints are non-reentrant;
+- ERC20 transfers use safe wrappers and follow checks-effects-interactions ordering;
 - withdrawal initiation freezes the note immediately;
 - stale-withdrawal challenge requires a real archived request proof;
 - no server receipt-only challenge;
@@ -1377,5 +1515,6 @@ These points are required implementation clarifications, not optional changes:
 - the client must track the balance blinding factor, and the server must return `blindDeltaSrv`;
 - the server must retain request proofs because stale-withdrawal challenges rely on them;
 - request proofs use the latest active root only;
+- request proofs encode genesis as `stateSigEpoch = 0` and `stateSigRoot = 0`;
 - withdrawal proofs bind the destination address to prevent front-running;
 - clearance signatures are verified inside the Cairo withdrawal proof, not directly in Solidity.
