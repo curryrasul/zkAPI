@@ -3,6 +3,8 @@
 # Rust
 rust/target/
 
+target/
+
 # Cairo / Scarb
 cairo/target/
 
