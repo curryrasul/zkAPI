@@ -1,0 +1,88 @@
+//! Wire format types for HTTP APIs.
+//!
+//! JSON serialization rules per spec section 12.1:
+//! - field elements: 0x-prefixed lowercase hex strings
+//! - curve points: objects with x and y hex fields
+//! - u128/u64/u32: decimal strings in JSON
+//! - proof blobs: base64 strings
+//! - UUIDs: canonical textual form
+
+use serde::{Deserialize, Serialize};
+
+use crate::Felt252;
+
+/// A curve point serialized as {x, y} hex fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CurvePointWire {
+    pub x: Felt252,
+    pub y: Felt252,
+}
+
+/// Successful request response from the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestResponse {
+    pub status: String,
+    pub client_request_id: String,
+    pub request_nullifier: Felt252,
+    pub response_code: u16,
+    pub response_payload: String,
+    pub response_hash: Felt252,
+    pub charge_applied: u128,
+    pub next_commitment: CurvePointWire,
+    pub next_anchor: Felt252,
+    pub blind_delta_srv: Felt252,
+    pub next_state_sig_epoch: u32,
+    pub next_state_sig: crate::XmssSignature,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_reason_code: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_evidence_hash: Option<Felt252>,
+}
+
+/// Error response from the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    pub status: String,
+    pub client_request_id: String,
+    pub error_code: String,
+    pub error_message: String,
+    pub retriable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_root: Option<Felt252>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_time_ms: Option<u64>,
+}
+
+/// API request payload sent by the client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiRequest {
+    pub client_request_id: String,
+    pub payload: String,
+    pub payload_hash: Felt252,
+    pub public_inputs: crate::RequestPublicInputs,
+    pub proof_envelope: String, // base64-encoded
+}
+
+/// Clearance request for mutual close.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClearanceRequest {
+    pub withdrawal_nullifier: Felt252,
+}
+
+/// Clearance response from the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClearanceResponse {
+    pub status: String,
+    pub withdrawal_nullifier: Felt252,
+    pub clear_sig_epoch: u32,
+    pub clear_sig: crate::XmssSignature,
+}
+
+/// Recovery response from the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryResponse {
+    pub status: String,
+    pub nullifier_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_response: Option<RequestResponse>,
+}

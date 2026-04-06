@@ -1,0 +1,181 @@
+// WOTS+ one-time signature verification built on Poseidon.
+//
+// Parameters (from spec section 4.9):
+//   w = 16  (base-16 digits)
+//   n = 248 bits (one felt252 message digest)
+//   len1 = 62  (ceil(248 / 4))
+//   len2 = 3
+//   len  = 65
+
+use core::poseidon::poseidon_hash_span;
+use zkapi_cairo::constants::WOTS_W;
+use zkapi_cairo::domains::{DOMAIN_XMSS_CHAIN, DOMAIN_XMSS_LEAF};
+
+// ---------------------------------------------------------------------------
+// Chain function
+// ---------------------------------------------------------------------------
+
+/// One step of the WOTS+ hash chain.
+/// chain_step(value, step) = Poseidon(DOMAIN_XMSS_CHAIN, value, step)
+pub fn chain_step(value: felt252, step: felt252) -> felt252 {
+    poseidon_hash_span(array![DOMAIN_XMSS_CHAIN, value, step].span())
+}
+
+/// Apply the chain function `steps` times starting from `value` at position
+/// `start`.  Each iteration hashes the current value with its absolute
+/// chain index (start + i).
+pub fn chain(value: felt252, start: u32, steps: u32) -> felt252 {
+    let mut current = value;
+    let mut i: u32 = 0;
+    loop {
+        if i == steps {
+            break;
+        }
+        let step_index: felt252 = (start + i).into();
+        current = chain_step(current, step_index);
+        i += 1;
+    };
+    current
+}
+
+// ---------------------------------------------------------------------------
+// Message-to-base-w conversion
+// ---------------------------------------------------------------------------
+
+/// Extract base-16 digits from a 248-bit message digest (one felt252).
+///
+/// Returns an array of `WOTS_LEN` (65) values:
+///   - indices 0..61  are the 62 base-16 digits of the message (MSB first)
+///   - indices 62..64 are the 3 base-16 digits of the checksum
+///
+/// Each digit is in [0, 15].
+pub fn message_to_base_w(message: felt252) -> Array<u32> {
+    let mut digits: Array<u32> = array![];
+
+    // Decompose message into 62 base-16 (4-bit) digits.
+    // We work with u256 for bit manipulation.
+    let msg_u256: u256 = message.into();
+    let mut remaining = msg_u256;
+
+    // Extract 62 nibbles from the most significant end.
+    // The message is 248 bits = 62 nibbles.
+    // Nibble 0 is bits [247..244], nibble 61 is bits [3..0].
+    let mut i: u32 = 0;
+    let mut nibbles: Array<u32> = array![];
+    loop {
+        if i == 62 {
+            break;
+        }
+        // Shift index: for nibble i, shift right by (61 - i) * 4 bits
+        let shift_amount: u32 = (61 - i) * 4;
+        let shifted = shr_u256(remaining, shift_amount);
+        let nibble: u32 = (shifted & 0xF_u256).try_into().unwrap();
+        nibbles.append(nibble);
+        i += 1;
+    };
+
+    // Compute checksum = sum of (w - 1 - digit) for all message digits.
+    let mut checksum: u32 = 0;
+    let mut j: u32 = 0;
+    loop {
+        if j == 62 {
+            break;
+        }
+        checksum += (WOTS_W - 1) - *nibbles.at(j);
+        j += 1;
+    };
+
+    // Decompose checksum into WOTS_LEN2 = 3 base-16 digits (MSB first).
+    // Maximum checksum = 62 * 15 = 930, which fits in 3 hex digits (0x3A2).
+    let cs_digit_2: u32 = checksum / 256; // 16^2
+    let cs_digit_1: u32 = (checksum % 256) / 16;
+    let cs_digit_0: u32 = checksum % 16;
+
+    // Build result: message digits followed by checksum digits.
+    let mut k: u32 = 0;
+    loop {
+        if k == 62 {
+            break;
+        }
+        digits.append(*nibbles.at(k));
+        k += 1;
+    };
+    digits.append(cs_digit_2);
+    digits.append(cs_digit_1);
+    digits.append(cs_digit_0);
+
+    digits
+}
+
+// ---------------------------------------------------------------------------
+// WOTS+ verification
+// ---------------------------------------------------------------------------
+
+/// Given a WOTS+ signature and message digest, recover the public key values
+/// by chaining each signature element from its digit position to w-1.
+///
+/// `wots_sig` must have exactly WOTS_LEN (65) elements.
+/// Returns an array of 65 recovered public key chain endpoints.
+pub fn wots_verify(wots_sig: Span<felt252>, message: felt252) -> Array<felt252> {
+    assert(wots_sig.len() == 65, 'invalid wots sig len');
+
+    let digits = message_to_base_w(message);
+    let mut pk_values: Array<felt252> = array![];
+
+    let mut i: u32 = 0;
+    loop {
+        if i == 65 {
+            break;
+        }
+        let digit = *digits.at(i);
+        // Chain from position digit to position (w - 1), i.e. (w - 1 - digit) steps.
+        let steps = WOTS_W - 1 - digit;
+        let recovered = chain(*wots_sig.at(i), digit, steps);
+        pk_values.append(recovered);
+        i += 1;
+    };
+
+    pk_values
+}
+
+/// Hash recovered public key values into a single leaf value.
+/// leaf = Poseidon(DOMAIN_XMSS_LEAF, pk[0], pk[1], ..., pk[64])
+pub fn wots_pk_to_leaf(pk_values: Span<felt252>) -> felt252 {
+    assert(pk_values.len() == 65, 'invalid pk values len');
+
+    let mut preimage: Array<felt252> = array![DOMAIN_XMSS_LEAF];
+    let mut i: u32 = 0;
+    loop {
+        if i == 65 {
+            break;
+        }
+        preimage.append(*pk_values.at(i));
+        i += 1;
+    };
+    poseidon_hash_span(preimage.span())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Logical right shift for u256.
+fn shr_u256(value: u256, shift: u32) -> u256 {
+    if shift == 0 {
+        return value;
+    }
+    if shift >= 256 {
+        return 0_u256;
+    }
+    // Cairo 2 supports u256 division.  Shifting right by n is dividing by 2^n.
+    let mut divisor: u256 = 1;
+    let mut i: u32 = 0;
+    loop {
+        if i == shift {
+            break;
+        }
+        divisor = divisor * 2;
+        i += 1;
+    };
+    value / divisor
+}

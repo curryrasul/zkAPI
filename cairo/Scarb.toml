@@ -1,0 +1,12 @@
+[package]
+name = "zkapi_cairo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+
+[cairo]
+sierra-replace-ids = true
+
+[tool.fmt]
+sort-module-level-items = true

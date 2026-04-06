@@ -1,0 +1,457 @@
+//! Withdrawal proof builder.
+//!
+//! Assembles the private witness for a withdrawal proof, computes all
+//! derived values (registration commitment, note leaf, nullifier),
+//! validates constraints locally, and can emit a mock proof blob for
+//! testing.
+
+use zkapi_core::poseidon::FieldElement;
+use thiserror::Error;
+
+use zkapi_core::leaf::{compute_note_leaf, compute_registration_commitment};
+use zkapi_core::merkle::verify_membership;
+use zkapi_core::nullifier::compute_nullifier;
+use zkapi_types::{
+    Felt252, WithdrawalPublicInputs, GENESIS_ANCHOR, MERKLE_DEPTH, STATEMENT_TYPE_WITHDRAWAL,
+};
+
+use crate::mock::MOCK_PROOF_ENVELOPE;
+
+// ---------------------------------------------------------------------------
+// Error
+// ---------------------------------------------------------------------------
+
+/// Errors produced when validating withdrawal witness constraints.
+#[derive(Debug, Error)]
+pub enum WithdrawalProofError {
+    #[error("registration commitment is zero")]
+    ZeroCommitment,
+
+    #[error("leaf is not a member of active_root (merkle proof invalid)")]
+    MerkleProofInvalid,
+
+    #[error("genesis: current_anchor must equal GENESIS_ANCHOR (1)")]
+    GenesisAnchorMismatch,
+
+    #[error("genesis: final_balance must equal deposit_amount")]
+    GenesisBalanceMismatch,
+
+    #[error("genesis: state_sig_epoch must be 0")]
+    GenesisEpochNonZero,
+
+    #[error("genesis: state_sig_root must be 0")]
+    GenesisRootNonZero,
+
+    #[error("non-genesis: state_sig_epoch must be > 0")]
+    NonGenesisEpochZero,
+
+    #[error("non-genesis: state_sig_root must be non-zero")]
+    NonGenesisRootZero,
+
+    #[error("final_balance ({final_balance}) > deposit_amount ({deposit_amount})")]
+    BalanceExceedsDeposit {
+        final_balance: u128,
+        deposit_amount: u128,
+    },
+
+    #[error("clearance: clear_sig_epoch must be > 0")]
+    ClearanceEpochZero,
+
+    #[error("clearance: clear_sig_root must be non-zero")]
+    ClearanceRootZero,
+
+    #[error("no-clearance: clear_sig_epoch must be 0")]
+    NoClearanceEpochNonZero,
+
+    #[error("no-clearance: clear_sig_root must be 0")]
+    NoClearanceRootNonZero,
+}
+
+// ---------------------------------------------------------------------------
+// Builder
+// ---------------------------------------------------------------------------
+
+/// Builder that holds the full private witness for a withdrawal proof and
+/// provides helpers to derive public inputs, validate constraints, and
+/// generate a mock proof blob.
+pub struct WithdrawalProofBuilder {
+    // -- private witness fields --
+    pub secret_s: Felt252,
+    pub note_id: u32,
+    pub deposit_amount: u128,
+    pub expiry_ts: u64,
+    pub merkle_siblings: [Felt252; MERKLE_DEPTH],
+    pub final_balance: u128,
+    pub final_blinding: FieldElement,
+    pub current_anchor: Felt252,
+    pub is_genesis: bool,
+    pub state_sig_epoch: u32,
+    pub state_sig_root: Felt252,
+    pub has_clearance: bool,
+    pub clear_sig_epoch: u32,
+    pub clear_sig_root: Felt252,
+    pub destination: [u8; 20],
+
+    // -- public / contextual --
+    pub active_root: Felt252,
+    pub protocol_version: u16,
+    pub chain_id: u64,
+    pub contract_address: Felt252,
+}
+
+impl WithdrawalProofBuilder {
+    /// Create a new builder with all witness and contextual fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        secret_s: Felt252,
+        note_id: u32,
+        deposit_amount: u128,
+        expiry_ts: u64,
+        merkle_siblings: [Felt252; MERKLE_DEPTH],
+        final_balance: u128,
+        final_blinding: FieldElement,
+        current_anchor: Felt252,
+        is_genesis: bool,
+        state_sig_epoch: u32,
+        state_sig_root: Felt252,
+        has_clearance: bool,
+        clear_sig_epoch: u32,
+        clear_sig_root: Felt252,
+        destination: [u8; 20],
+        active_root: Felt252,
+        protocol_version: u16,
+        chain_id: u64,
+        contract_address: Felt252,
+    ) -> Self {
+        Self {
+            secret_s,
+            note_id,
+            deposit_amount,
+            expiry_ts,
+            merkle_siblings,
+            final_balance,
+            final_blinding,
+            current_anchor,
+            is_genesis,
+            state_sig_epoch,
+            state_sig_root,
+            has_clearance,
+            clear_sig_epoch,
+            clear_sig_root,
+            destination,
+            active_root,
+            protocol_version,
+            chain_id,
+            contract_address,
+        }
+    }
+
+    // -- derived values ------------------------------------------------
+
+    /// Registration commitment: `C = Poseidon(DOMAIN_REG, secret_s, 0)`.
+    pub fn registration_commitment(&self) -> Felt252 {
+        compute_registration_commitment(&self.secret_s)
+    }
+
+    /// Note leaf: `Poseidon(DOMAIN_LEAF, note_id, C, deposit_amount, expiry_ts)`.
+    pub fn note_leaf(&self) -> Felt252 {
+        let c = self.registration_commitment();
+        compute_note_leaf(self.note_id, &c, self.deposit_amount, self.expiry_ts)
+    }
+
+    /// Withdrawal nullifier: `Poseidon(DOMAIN_NULL, secret_s, current_anchor)`.
+    pub fn nullifier(&self) -> Felt252 {
+        compute_nullifier(&self.secret_s, &self.current_anchor)
+    }
+
+    // -- public inputs -------------------------------------------------
+
+    /// Build the `WithdrawalPublicInputs` struct from the witness.
+    pub fn build_public_inputs(&self) -> WithdrawalPublicInputs {
+        WithdrawalPublicInputs {
+            statement_type: STATEMENT_TYPE_WITHDRAWAL,
+            protocol_version: self.protocol_version,
+            chain_id: self.chain_id,
+            contract_address: self.contract_address,
+            active_root: self.active_root,
+            note_id: self.note_id,
+            final_balance: self.final_balance,
+            destination: self.destination,
+            withdrawal_nullifier: self.nullifier(),
+            is_genesis: self.is_genesis,
+            has_clearance: self.has_clearance,
+            state_sig_epoch: self.state_sig_epoch,
+            state_sig_root: self.state_sig_root,
+            clear_sig_epoch: self.clear_sig_epoch,
+            clear_sig_root: self.clear_sig_root,
+        }
+    }
+
+    // -- validation ----------------------------------------------------
+
+    /// Run all circuit-equivalent constraint checks locally.
+    ///
+    /// This mirrors the Cairo withdrawal program constraints (spec section 8.3)
+    /// so that callers can detect invalid witnesses before sending to a
+    /// (potentially expensive) prover.
+    pub fn validate(&self) -> Result<(), WithdrawalProofError> {
+        // 1. Registration commitment must be non-zero.
+        let c = self.registration_commitment();
+        if c.is_zero() {
+            return Err(WithdrawalProofError::ZeroCommitment);
+        }
+
+        // 2-3. Leaf membership in active_root.
+        let leaf = self.note_leaf();
+        if !verify_membership(&self.active_root, self.note_id, &leaf, &self.merkle_siblings) {
+            return Err(WithdrawalProofError::MerkleProofInvalid);
+        }
+
+        // 4-5. Genesis vs non-genesis state validity.
+        if self.is_genesis {
+            // current_anchor must equal GENESIS_ANCHOR (= 1).
+            if self.current_anchor != Felt252::from_u64(GENESIS_ANCHOR) {
+                return Err(WithdrawalProofError::GenesisAnchorMismatch);
+            }
+            // final_balance must equal deposit_amount.
+            if self.final_balance != self.deposit_amount {
+                return Err(WithdrawalProofError::GenesisBalanceMismatch);
+            }
+            // state_sig_epoch must be 0.
+            if self.state_sig_epoch != 0 {
+                return Err(WithdrawalProofError::GenesisEpochNonZero);
+            }
+            // state_sig_root must be 0.
+            if !self.state_sig_root.is_zero() {
+                return Err(WithdrawalProofError::GenesisRootNonZero);
+            }
+        } else {
+            // Non-genesis: state_sig_epoch > 0, state_sig_root != 0.
+            if self.state_sig_epoch == 0 {
+                return Err(WithdrawalProofError::NonGenesisEpochZero);
+            }
+            if self.state_sig_root.is_zero() {
+                return Err(WithdrawalProofError::NonGenesisRootZero);
+            }
+            // NOTE: actual XMSS signature verification is not performed here;
+            // that is the responsibility of the Cairo program.
+        }
+
+        // 7. final_balance <= deposit_amount.
+        if self.final_balance > self.deposit_amount {
+            return Err(WithdrawalProofError::BalanceExceedsDeposit {
+                final_balance: self.final_balance,
+                deposit_amount: self.deposit_amount,
+            });
+        }
+
+        // 8-9. Clearance constraints.
+        if self.has_clearance {
+            if self.clear_sig_epoch == 0 {
+                return Err(WithdrawalProofError::ClearanceEpochZero);
+            }
+            if self.clear_sig_root.is_zero() {
+                return Err(WithdrawalProofError::ClearanceRootZero);
+            }
+            // NOTE: actual XMSS clearance signature verification is not
+            // performed here; that is the responsibility of the Cairo program.
+        } else {
+            if self.clear_sig_epoch != 0 {
+                return Err(WithdrawalProofError::NoClearanceEpochNonZero);
+            }
+            if !self.clear_sig_root.is_zero() {
+                return Err(WithdrawalProofError::NoClearanceRootNonZero);
+            }
+        }
+
+        Ok(())
+    }
+
+    // -- mock proof ----------------------------------------------------
+
+    /// Produce a mock proof blob for testing.
+    ///
+    /// In a production build this would invoke the Cairo STARK prover.
+    pub fn generate_mock_proof(&self) -> Vec<u8> {
+        MOCK_PROOF_ENVELOPE.to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zkapi_core::merkle::MerkleTree;
+
+    /// Helper: build a minimal genesis withdrawal witness that passes validation.
+    fn genesis_builder() -> WithdrawalProofBuilder {
+        let secret = Felt252::from_u64(42);
+        let deposit = 1_000u128;
+        let expiry = 1_700_000_000u64;
+
+        let c = compute_registration_commitment(&secret);
+        let leaf = compute_note_leaf(0, &c, deposit, expiry);
+        let mut tree = MerkleTree::new();
+        tree.insert(leaf);
+        let siblings = tree.get_siblings(0);
+        let root = tree.root();
+
+        let destination = [0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+        WithdrawalProofBuilder::new(
+            secret,
+            0,                          // note_id
+            deposit,
+            expiry,
+            siblings,
+            deposit,                    // final_balance == deposit for genesis
+            FieldElement::ZERO,         // final_blinding
+            Felt252::from_u64(GENESIS_ANCHOR), // current_anchor = 1
+            true,                       // is_genesis
+            0,                          // state_sig_epoch
+            Felt252::ZERO,              // state_sig_root
+            false,                      // has_clearance
+            0,                          // clear_sig_epoch
+            Felt252::ZERO,              // clear_sig_root
+            destination,
+            root,                       // active_root
+            1,                          // protocol_version
+            1,                          // chain_id
+            Felt252::from_u64(0xdead),  // contract_address
+        )
+    }
+
+    #[test]
+    fn test_genesis_validate_ok() {
+        let builder = genesis_builder();
+        builder.validate().expect("genesis builder should validate");
+    }
+
+    #[test]
+    fn test_build_public_inputs() {
+        let builder = genesis_builder();
+        let pi = builder.build_public_inputs();
+        assert_eq!(pi.statement_type, STATEMENT_TYPE_WITHDRAWAL);
+        assert_eq!(pi.protocol_version, 1);
+        assert_eq!(pi.chain_id, 1);
+        assert_eq!(pi.note_id, 0);
+        assert_eq!(pi.final_balance, 1_000);
+        assert!(!pi.withdrawal_nullifier.is_zero());
+        assert!(pi.is_genesis);
+        assert!(!pi.has_clearance);
+    }
+
+    #[test]
+    fn test_balance_exceeds_deposit() {
+        let mut builder = genesis_builder();
+        // Need to set both balances so genesis constraint still holds first;
+        // easiest: break the genesis balance match and see that error, so
+        // instead test on non-genesis path.
+        builder.is_genesis = false;
+        builder.state_sig_epoch = 1;
+        builder.state_sig_root = Felt252::from_u64(0xabc);
+        builder.current_anchor = Felt252::from_u64(99);
+        builder.final_balance = builder.deposit_amount + 1;
+        let err = builder.validate().unwrap_err();
+        assert!(matches!(err, WithdrawalProofError::BalanceExceedsDeposit { .. }));
+    }
+
+    #[test]
+    fn test_genesis_anchor_mismatch() {
+        let mut builder = genesis_builder();
+        builder.current_anchor = Felt252::from_u64(99);
+        let err = builder.validate().unwrap_err();
+        assert!(matches!(err, WithdrawalProofError::GenesisAnchorMismatch));
+    }
+
+    #[test]
+    fn test_genesis_balance_mismatch() {
+        let mut builder = genesis_builder();
+        builder.final_balance = builder.deposit_amount - 1;
+        let err = builder.validate().unwrap_err();
+        assert!(matches!(err, WithdrawalProofError::GenesisBalanceMismatch));
+    }
+
+    #[test]
+    fn test_merkle_proof_invalid() {
+        let mut builder = genesis_builder();
+        builder.merkle_siblings[0] = Felt252::from_u64(0xbad);
+        let err = builder.validate().unwrap_err();
+        assert!(matches!(err, WithdrawalProofError::MerkleProofInvalid));
+    }
+
+    #[test]
+    fn test_clearance_epoch_zero() {
+        let mut builder = genesis_builder();
+        builder.has_clearance = true;
+        builder.clear_sig_epoch = 0;
+        builder.clear_sig_root = Felt252::from_u64(0xabc);
+        let err = builder.validate().unwrap_err();
+        assert!(matches!(err, WithdrawalProofError::ClearanceEpochZero));
+    }
+
+    #[test]
+    fn test_clearance_root_zero() {
+        let mut builder = genesis_builder();
+        builder.has_clearance = true;
+        builder.clear_sig_epoch = 1;
+        builder.clear_sig_root = Felt252::ZERO;
+        let err = builder.validate().unwrap_err();
+        assert!(matches!(err, WithdrawalProofError::ClearanceRootZero));
+    }
+
+    #[test]
+    fn test_no_clearance_epoch_nonzero() {
+        let mut builder = genesis_builder();
+        builder.has_clearance = false;
+        builder.clear_sig_epoch = 1;
+        let err = builder.validate().unwrap_err();
+        assert!(matches!(err, WithdrawalProofError::NoClearanceEpochNonZero));
+    }
+
+    #[test]
+    fn test_no_clearance_root_nonzero() {
+        let mut builder = genesis_builder();
+        builder.has_clearance = false;
+        builder.clear_sig_root = Felt252::from_u64(0xabc);
+        let err = builder.validate().unwrap_err();
+        assert!(matches!(err, WithdrawalProofError::NoClearanceRootNonZero));
+    }
+
+    #[test]
+    fn test_non_genesis_epoch_zero() {
+        let mut builder = genesis_builder();
+        builder.is_genesis = false;
+        builder.state_sig_epoch = 0;
+        builder.current_anchor = Felt252::from_u64(99);
+        let err = builder.validate().unwrap_err();
+        assert!(matches!(err, WithdrawalProofError::NonGenesisEpochZero));
+    }
+
+    #[test]
+    fn test_non_genesis_root_zero() {
+        let mut builder = genesis_builder();
+        builder.is_genesis = false;
+        builder.state_sig_epoch = 1;
+        builder.state_sig_root = Felt252::ZERO;
+        builder.current_anchor = Felt252::from_u64(99);
+        let err = builder.validate().unwrap_err();
+        assert!(matches!(err, WithdrawalProofError::NonGenesisRootZero));
+    }
+
+    #[test]
+    fn test_mock_proof_generation() {
+        let builder = genesis_builder();
+        let proof = builder.generate_mock_proof();
+        assert_eq!(proof.len(), 32);
+        assert!(proof.iter().all(|&b| b == 0x42));
+    }
+
+    #[test]
+    fn test_nullifier_deterministic() {
+        let builder = genesis_builder();
+        let n1 = builder.nullifier();
+        let n2 = builder.nullifier();
+        assert_eq!(n1, n2);
+        assert!(!n1.is_zero());
+    }
+}
