@@ -12,6 +12,9 @@ cairo/target/
 contracts/out/
 contracts/cache/
 
+# mdBook
+docs/book/
+
 # Local runtime state
 .zkapi/
 *.db

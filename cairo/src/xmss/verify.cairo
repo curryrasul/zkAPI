@@ -4,8 +4,8 @@
 
 use core::poseidon::poseidon_hash_span;
 use zkapi_cairo::domains::DOMAIN_XMSS_MSG;
-use super::wots::{wots_verify, wots_pk_to_leaf};
 use super::tree::verify_auth_path;
+use super::wots::{wots_pk_to_leaf, wots_verify};
 
 /// Verify a full XMSS signature.
 ///

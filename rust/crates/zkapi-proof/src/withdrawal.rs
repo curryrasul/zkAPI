@@ -5,14 +5,20 @@
 //! validates constraints locally, and can emit a mock proof blob for
 //! testing.
 
+use serde::{Deserialize, Serialize};
 use zkapi_core::poseidon::FieldElement;
 use thiserror::Error;
 
+use zkapi_core::commitment::{compute_clearance_message, compute_state_message};
 use zkapi_core::leaf::{compute_note_leaf, compute_registration_commitment};
 use zkapi_core::merkle::verify_membership;
 use zkapi_core::nullifier::compute_nullifier;
+use zkapi_core::poseidon::{felt_to_field, field_to_felt};
+use zkapi_crypto::pedersen::PedersenCommitment;
+use zkapi_crypto::xmss::XmssVerifier;
 use zkapi_types::{
-    Felt252, WithdrawalPublicInputs, GENESIS_ANCHOR, MERKLE_DEPTH, STATEMENT_TYPE_WITHDRAWAL,
+    Felt252, WithdrawalPublicInputs, XmssSignature, GENESIS_ANCHOR, MERKLE_DEPTH,
+    STATEMENT_TYPE_WITHDRAWAL,
 };
 
 use crate::mock::MOCK_PROOF_ENVELOPE;
@@ -65,6 +71,52 @@ pub enum WithdrawalProofError {
 
     #[error("no-clearance: clear_sig_root must be 0")]
     NoClearanceRootNonZero,
+
+    #[error("missing non-genesis state signature")]
+    MissingStateSignature,
+
+    #[error("unexpected state signature on genesis witness")]
+    UnexpectedStateSignature,
+
+    #[error("state signature epoch mismatch: expected {expected}, got {actual}")]
+    StateSignatureEpochMismatch { expected: u32, actual: u32 },
+
+    #[error("state signature verification failed: {0}")]
+    StateSignatureInvalid(String),
+
+    #[error("missing clearance signature")]
+    MissingClearanceSignature,
+
+    #[error("unexpected clearance signature without clearance flag")]
+    UnexpectedClearanceSignature,
+
+    #[error("clearance signature epoch mismatch: expected {expected}, got {actual}")]
+    ClearanceSignatureEpochMismatch { expected: u32, actual: u32 },
+
+    #[error("clearance signature verification failed: {0}")]
+    ClearanceSignatureInvalid(String),
+
+    #[error("proof envelope serialization failed: {0}")]
+    Serialization(String),
+
+    #[error("proof envelope public inputs do not match expected withdrawal inputs")]
+    PublicInputsMismatch,
+}
+
+/// Serialized withdrawal proof envelope used by the Rust client/server pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WithdrawalProofEnvelope {
+    pub public_inputs: WithdrawalPublicInputs,
+    pub secret_s: Felt252,
+    pub deposit_amount: u128,
+    pub expiry_ts: u64,
+    pub merkle_siblings: [Felt252; MERKLE_DEPTH],
+    pub final_blinding: Felt252,
+    pub current_anchor: Felt252,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_sig: Option<XmssSignature>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_sig: Option<XmssSignature>,
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +319,108 @@ impl WithdrawalProofBuilder {
         Ok(())
     }
 
+    /// Run all local checks including XMSS verification for state/clearance signatures.
+    pub fn validate_with_signatures(
+        &self,
+        state_sig: Option<&XmssSignature>,
+        clear_sig: Option<&XmssSignature>,
+    ) -> Result<(), WithdrawalProofError> {
+        self.validate()?;
+
+        if self.is_genesis {
+            if state_sig.is_some() {
+                return Err(WithdrawalProofError::UnexpectedStateSignature);
+            }
+        } else {
+            let sig = state_sig.ok_or(WithdrawalProofError::MissingStateSignature)?;
+            if sig.epoch != self.state_sig_epoch {
+                return Err(WithdrawalProofError::StateSignatureEpochMismatch {
+                    expected: self.state_sig_epoch,
+                    actual: sig.epoch,
+                });
+            }
+            sig.validate()
+                .map_err(WithdrawalProofError::StateSignatureInvalid)?;
+
+            let commitment = PedersenCommitment::commit(self.final_balance, &self.final_blinding);
+            let (current_x, current_y) = commitment.to_affine();
+            let state_msg = compute_state_message(
+                self.protocol_version,
+                self.chain_id,
+                &self.contract_address,
+                &field_to_felt(&current_x),
+                &field_to_felt(&current_y),
+                &self.current_anchor,
+            );
+            if !XmssVerifier::verify(&self.state_sig_root, &state_msg, sig) {
+                return Err(WithdrawalProofError::StateSignatureInvalid(
+                    "XMSS root/path verification failed".to_string(),
+                ));
+            }
+        }
+
+        if self.has_clearance {
+            let sig = clear_sig.ok_or(WithdrawalProofError::MissingClearanceSignature)?;
+            if sig.epoch != self.clear_sig_epoch {
+                return Err(WithdrawalProofError::ClearanceSignatureEpochMismatch {
+                    expected: self.clear_sig_epoch,
+                    actual: sig.epoch,
+                });
+            }
+            sig.validate()
+                .map_err(WithdrawalProofError::ClearanceSignatureInvalid)?;
+
+            let nullifier = self.nullifier();
+            let clear_msg = compute_clearance_message(
+                self.protocol_version,
+                self.chain_id,
+                &self.contract_address,
+                &nullifier,
+            );
+            if !XmssVerifier::verify(&self.clear_sig_root, &clear_msg, sig) {
+                return Err(WithdrawalProofError::ClearanceSignatureInvalid(
+                    "XMSS root/path verification failed".to_string(),
+                ));
+            }
+        } else if clear_sig.is_some() {
+            return Err(WithdrawalProofError::UnexpectedClearanceSignature);
+        }
+
+        Ok(())
+    }
+
+    /// Build a serialized witness envelope that the verifier can re-run locally.
+    pub fn build_envelope(
+        &self,
+        state_sig: Option<&XmssSignature>,
+        clear_sig: Option<&XmssSignature>,
+    ) -> Result<WithdrawalProofEnvelope, WithdrawalProofError> {
+        self.validate_with_signatures(state_sig, clear_sig)?;
+
+        Ok(WithdrawalProofEnvelope {
+            public_inputs: self.build_public_inputs(),
+            secret_s: self.secret_s,
+            deposit_amount: self.deposit_amount,
+            expiry_ts: self.expiry_ts,
+            merkle_siblings: self.merkle_siblings,
+            final_blinding: field_to_felt(&self.final_blinding),
+            current_anchor: self.current_anchor,
+            state_sig: state_sig.cloned(),
+            clear_sig: clear_sig.cloned(),
+        })
+    }
+
+    /// Serialize the proof envelope as JSON bytes.
+    pub fn generate_proof(
+        &self,
+        state_sig: Option<&XmssSignature>,
+        clear_sig: Option<&XmssSignature>,
+    ) -> Result<Vec<u8>, WithdrawalProofError> {
+        let envelope = self.build_envelope(state_sig, clear_sig)?;
+        serde_json::to_vec(&envelope)
+            .map_err(|e| WithdrawalProofError::Serialization(e.to_string()))
+    }
+
     // -- mock proof ----------------------------------------------------
 
     /// Produce a mock proof blob for testing.
@@ -277,10 +431,53 @@ impl WithdrawalProofBuilder {
     }
 }
 
+/// Verify a serialized withdrawal proof envelope against expected public inputs.
+pub fn verify_withdrawal_proof(
+    proof: &[u8],
+    expected_inputs: &WithdrawalPublicInputs,
+) -> Result<(), WithdrawalProofError> {
+    let envelope: WithdrawalProofEnvelope = serde_json::from_slice(proof)
+        .map_err(|e| WithdrawalProofError::Serialization(e.to_string()))?;
+    if &envelope.public_inputs != expected_inputs {
+        return Err(WithdrawalProofError::PublicInputsMismatch);
+    }
+
+    let builder = WithdrawalProofBuilder::new(
+        envelope.secret_s,
+        expected_inputs.note_id,
+        envelope.deposit_amount,
+        envelope.expiry_ts,
+        envelope.merkle_siblings,
+        expected_inputs.final_balance,
+        felt_to_field(&envelope.final_blinding),
+        envelope.current_anchor,
+        expected_inputs.is_genesis,
+        expected_inputs.state_sig_epoch,
+        expected_inputs.state_sig_root,
+        expected_inputs.has_clearance,
+        expected_inputs.clear_sig_epoch,
+        expected_inputs.clear_sig_root,
+        expected_inputs.destination,
+        expected_inputs.active_root,
+        expected_inputs.protocol_version,
+        expected_inputs.chain_id,
+        expected_inputs.contract_address,
+    );
+
+    let rebuilt_inputs = builder.build_public_inputs();
+    if &rebuilt_inputs != expected_inputs {
+        return Err(WithdrawalProofError::PublicInputsMismatch);
+    }
+
+    builder.validate_with_signatures(envelope.state_sig.as_ref(), envelope.clear_sig.as_ref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zkapi_core::commitment::{compute_clearance_message, compute_state_message};
     use zkapi_core::merkle::MerkleTree;
+    use zkapi_crypto::xmss::XmssKeypair;
 
     /// Helper: build a minimal genesis withdrawal witness that passes validation.
     fn genesis_builder() -> WithdrawalProofBuilder {
@@ -453,5 +650,49 @@ mod tests {
         let n2 = builder.nullifier();
         assert_eq!(n1, n2);
         assert!(!n1.is_zero());
+    }
+
+    #[test]
+    fn test_real_proof_roundtrip_with_clearance() {
+        let mut builder = genesis_builder();
+        builder.is_genesis = false;
+        builder.final_balance = 900;
+        builder.final_blinding = FieldElement::from(9u64);
+        builder.current_anchor = Felt252::from_u64(55);
+        builder.has_clearance = true;
+
+        let state_keypair = XmssKeypair::generate_with_height(&FieldElement::from(123u64), 4);
+        builder.state_sig_epoch = 7;
+        builder.state_sig_root = state_keypair.root_felt();
+
+        let clear_keypair = XmssKeypair::generate_with_height(&FieldElement::from(456u64), 4);
+        builder.clear_sig_epoch = 8;
+        builder.clear_sig_root = clear_keypair.root_felt();
+
+        let commitment = PedersenCommitment::commit(builder.final_balance, &builder.final_blinding);
+        let (cx, cy) = commitment.to_affine();
+        let state_msg = compute_state_message(
+            builder.protocol_version,
+            builder.chain_id,
+            &builder.contract_address,
+            &field_to_felt(&cx),
+            &field_to_felt(&cy),
+            &builder.current_anchor,
+        );
+        let (mut state_sig, _) = state_keypair.sign(&state_msg).unwrap();
+        state_sig.epoch = builder.state_sig_epoch;
+
+        let clear_msg = compute_clearance_message(
+            builder.protocol_version,
+            builder.chain_id,
+            &builder.contract_address,
+            &builder.nullifier(),
+        );
+        let (mut clear_sig, _) = clear_keypair.sign(&clear_msg).unwrap();
+        clear_sig.epoch = builder.clear_sig_epoch;
+
+        let public_inputs = builder.build_public_inputs();
+        let proof = builder.generate_proof(Some(&state_sig), Some(&clear_sig)).unwrap();
+        verify_withdrawal_proof(&proof, &public_inputs).unwrap();
     }
 }

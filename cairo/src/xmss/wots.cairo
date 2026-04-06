@@ -27,14 +27,11 @@ pub fn chain_step(value: felt252, step: felt252) -> felt252 {
 pub fn chain(value: felt252, start: u32, steps: u32) -> felt252 {
     let mut current = value;
     let mut i: u32 = 0;
-    loop {
-        if i == steps {
-            break;
-        }
+    while i < steps {
         let step_index: felt252 = (start + i).into();
         current = chain_step(current, step_index);
         i += 1;
-    };
+    }
     current
 }
 
@@ -62,28 +59,22 @@ pub fn message_to_base_w(message: felt252) -> Array<u32> {
     // Nibble 0 is bits [247..244], nibble 61 is bits [3..0].
     let mut i: u32 = 0;
     let mut nibbles: Array<u32> = array![];
-    loop {
-        if i == 62 {
-            break;
-        }
+    while i < 62 {
         // Shift index: for nibble i, shift right by (61 - i) * 4 bits
         let shift_amount: u32 = (61 - i) * 4;
         let shifted = shr_u256(remaining, shift_amount);
         let nibble: u32 = (shifted & 0xF_u256).try_into().unwrap();
         nibbles.append(nibble);
         i += 1;
-    };
+    }
 
     // Compute checksum = sum of (w - 1 - digit) for all message digits.
     let mut checksum: u32 = 0;
     let mut j: u32 = 0;
-    loop {
-        if j == 62 {
-            break;
-        }
+    while j < 62 {
         checksum += (WOTS_W - 1) - *nibbles.at(j);
         j += 1;
-    };
+    }
 
     // Decompose checksum into WOTS_LEN2 = 3 base-16 digits (MSB first).
     // Maximum checksum = 62 * 15 = 930, which fits in 3 hex digits (0x3A2).
@@ -93,13 +84,10 @@ pub fn message_to_base_w(message: felt252) -> Array<u32> {
 
     // Build result: message digits followed by checksum digits.
     let mut k: u32 = 0;
-    loop {
-        if k == 62 {
-            break;
-        }
+    while k < 62 {
         digits.append(*nibbles.at(k));
         k += 1;
-    };
+    }
     digits.append(cs_digit_2);
     digits.append(cs_digit_1);
     digits.append(cs_digit_0);
@@ -123,17 +111,14 @@ pub fn wots_verify(wots_sig: Span<felt252>, message: felt252) -> Array<felt252> 
     let mut pk_values: Array<felt252> = array![];
 
     let mut i: u32 = 0;
-    loop {
-        if i == 65 {
-            break;
-        }
+    while i < 65 {
         let digit = *digits.at(i);
         // Chain from position digit to position (w - 1), i.e. (w - 1 - digit) steps.
         let steps = WOTS_W - 1 - digit;
         let recovered = chain(*wots_sig.at(i), digit, steps);
         pk_values.append(recovered);
         i += 1;
-    };
+    }
 
     pk_values
 }
@@ -145,13 +130,10 @@ pub fn wots_pk_to_leaf(pk_values: Span<felt252>) -> felt252 {
 
     let mut preimage: Array<felt252> = array![DOMAIN_XMSS_LEAF];
     let mut i: u32 = 0;
-    loop {
-        if i == 65 {
-            break;
-        }
+    while i < 65 {
         preimage.append(*pk_values.at(i));
         i += 1;
-    };
+    }
     poseidon_hash_span(preimage.span())
 }
 
@@ -170,12 +152,9 @@ fn shr_u256(value: u256, shift: u32) -> u256 {
     // Cairo 2 supports u256 division.  Shifting right by n is dividing by 2^n.
     let mut divisor: u256 = 1;
     let mut i: u32 = 0;
-    loop {
-        if i == shift {
-            break;
-        }
+    while i < shift {
         divisor = divisor * 2;
         i += 1;
-    };
+    }
     value / divisor
 }

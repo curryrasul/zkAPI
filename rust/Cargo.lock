@@ -2489,6 +2489,7 @@ name = "zkapi-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "hex",
  "rand 0.8.5",
  "reqwest",
@@ -2573,6 +2574,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "hex",
  "rand 0.8.5",
  "rusqlite",

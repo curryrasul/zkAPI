@@ -25,6 +25,8 @@ pub struct PendingRequestJournal {
     pub nullifier: Felt252,
     /// Hash of the request payload.
     pub payload_hash: Felt252,
+    /// Client-side rerandomization used to build the request proof.
+    pub user_rerandomization: Felt252,
     /// Wall-clock time when the journal was created (milliseconds since epoch).
     pub created_at_ms: u64,
 }
@@ -95,6 +97,7 @@ mod tests {
             client_request_id: "test-uuid-1234".to_string(),
             nullifier: Felt252::from_u64(999),
             payload_hash: Felt252::from_u64(0xabcd),
+            user_rerandomization: Felt252::from_u64(7),
             created_at_ms: 1700000000000,
         };
         PendingRequestJournal::write(&path, &journal).unwrap();
@@ -119,6 +122,7 @@ mod tests {
             client_request_id: "x".to_string(),
             nullifier: Felt252::ZERO,
             payload_hash: Felt252::ZERO,
+            user_rerandomization: Felt252::ZERO,
             created_at_ms: 0,
         };
         PendingRequestJournal::write(&path, &journal).unwrap();

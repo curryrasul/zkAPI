@@ -25,11 +25,7 @@ contract FactRegistryAdapter is IZkApiProofAdapter {
     /// @notice Allowed Cairo program hash for withdrawal proofs (statement type 2).
     bytes32 public immutable withdrawalProgramHash;
 
-    constructor(
-        address _factRegistry,
-        bytes32 _requestProgramHash,
-        bytes32 _withdrawalProgramHash
-    ) {
+    constructor(address _factRegistry, bytes32 _requestProgramHash, bytes32 _withdrawalProgramHash) {
         factRegistry = IFactRegistry(_factRegistry);
         requestProgramHash = _requestProgramHash;
         withdrawalProgramHash = _withdrawalProgramHash;
@@ -39,7 +35,11 @@ contract FactRegistryAdapter is IZkApiProofAdapter {
     function assertValidRequest(
         Types.RequestPublicInputs calldata inputs,
         bytes calldata /* proofEnvelope */
-    ) external view override {
+    )
+        external
+        view
+        override
+    {
         if (inputs.statementType != 1) revert Errors.InvalidStatementType();
 
         bytes32 outputHash = _hashRequestOutputs(inputs);
@@ -52,7 +52,11 @@ contract FactRegistryAdapter is IZkApiProofAdapter {
     function assertValidWithdrawal(
         Types.WithdrawalPublicInputs calldata inputs,
         bytes calldata /* proofEnvelope */
-    ) external view override {
+    )
+        external
+        view
+        override
+    {
         if (inputs.statementType != 2) revert Errors.InvalidStatementType();
 
         bytes32 outputHash = _hashWithdrawalOutputs(inputs);
@@ -63,9 +67,7 @@ contract FactRegistryAdapter is IZkApiProofAdapter {
 
     /// @dev Reconstruct the output hash for a request proof from its public inputs.
     ///      The fields are encoded in the same order as the Cairo program emits them.
-    function _hashRequestOutputs(
-        Types.RequestPublicInputs calldata inputs
-    ) internal pure returns (bytes32) {
+    function _hashRequestOutputs(Types.RequestPublicInputs calldata inputs) internal pure returns (bytes32) {
         return keccak256(
             abi.encodePacked(
                 inputs.statementType,
@@ -85,9 +87,7 @@ contract FactRegistryAdapter is IZkApiProofAdapter {
     }
 
     /// @dev Reconstruct the output hash for a withdrawal proof from its public inputs.
-    function _hashWithdrawalOutputs(
-        Types.WithdrawalPublicInputs calldata inputs
-    ) internal pure returns (bytes32) {
+    function _hashWithdrawalOutputs(Types.WithdrawalPublicInputs calldata inputs) internal pure returns (bytes32) {
         return keccak256(
             abi.encodePacked(
                 inputs.statementType,

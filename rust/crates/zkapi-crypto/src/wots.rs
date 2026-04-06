@@ -65,19 +65,19 @@ pub fn message_to_base_w(message: &FieldElement) -> ([u32; WOTS_LEN1], [u32; WOT
     // Extract 248 bits = 62 nibbles (4 bits each for w=16)
     // We use bits [8..256] of the 256-bit representation (skip top 8 bits to get 248 bits)
     let mut msg_digits = [0u32; WOTS_LEN1];
-    for i in 0..WOTS_LEN1 {
+    for (i, digit) in msg_digits.iter_mut().enumerate().take(WOTS_LEN1) {
         // Each digit is 4 bits
         let bit_offset = 8 + i * 4; // start from bit 8
         let byte_idx = bit_offset / 8;
         let bit_in_byte = bit_offset % 8;
 
         if bit_in_byte <= 4 {
-            msg_digits[i] = ((bytes[byte_idx] >> (4 - bit_in_byte)) & 0x0F) as u32;
+            *digit = ((bytes[byte_idx] >> (4 - bit_in_byte)) & 0x0F) as u32;
         } else {
             // Spans two bytes
             let high = (bytes[byte_idx] << (bit_in_byte - 4)) & 0x0F;
             let low = bytes[byte_idx + 1] >> (12 - bit_in_byte);
-            msg_digits[i] = (high | low) as u32;
+            *digit = (high | low) as u32;
         }
     }
 
@@ -145,8 +145,8 @@ mod tests {
 
     fn random_secret_key() -> [FieldElement; WOTS_LEN] {
         let mut sk = [FieldElement::ZERO; WOTS_LEN];
-        for i in 0..WOTS_LEN {
-            sk[i] = FieldElement::from(i as u64 + 1);
+        for (i, item) in sk.iter_mut().enumerate().take(WOTS_LEN) {
+            *item = FieldElement::from(i as u64 + 1);
         }
         sk
     }

@@ -13,6 +13,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
+use zkapi_core::poseidon::felt_to_field;
 use zkapi_types::wire::{
     ApiRequest, ClearanceRequest, ClearanceResponse, ErrorResponse, RecoveryResponse,
     RequestResponse,
@@ -20,6 +21,7 @@ use zkapi_types::wire::{
 use zkapi_types::Felt252;
 
 use crate::error::ServerError;
+use crate::provider::EchoProvider;
 use crate::processor::RequestProcessor;
 
 /// Shared application state.
@@ -27,19 +29,20 @@ type AppState = Arc<RequestProcessor>;
 
 /// Start the HTTP server with the given config.
 pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<()> {
-    use starknet_types_core::felt::Felt;
     let store = Arc::new(crate::nullifier_store::NullifierStore::new(&config.db_path)?);
     let signer = Arc::new(crate::signer::ServerSigner::with_height(
-        Felt::from(1u64), // state seed
-        Felt::from(2u64), // clear seed
-        1,                // epoch
-        4,                // small tree height for development
+        felt_to_field(&config.state_seed),
+        felt_to_field(&config.clear_seed),
+        config.epoch,
+        config.xmss_height,
     ));
+    let provider = Arc::new(EchoProvider::default());
     let processor = Arc::new(RequestProcessor::new(
         config.clone(),
         store,
         signer,
-        zkapi_types::Felt252::ZERO, // initial root
+        provider,
+        config.initial_root,
     ));
     let router = create_router(processor);
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
@@ -120,7 +123,7 @@ fn error_to_response(
     processor: &RequestProcessor,
 ) -> (StatusCode, Json<ErrorResponse>) {
     let status_code = match err {
-        ServerError::InvalidProof
+        ServerError::InvalidProof(_)
         | ServerError::InvalidRequest(_)
         | ServerError::ProtocolMismatch(_) => StatusCode::BAD_REQUEST,
         ServerError::StaleRoot { .. } => StatusCode::CONFLICT,

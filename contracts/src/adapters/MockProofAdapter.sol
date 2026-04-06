@@ -26,8 +26,12 @@ contract MockProofAdapter is IZkApiProofAdapter {
     }
 
     modifier onlyAdmin() {
-        if (msg.sender != admin) revert Errors.Unauthorized();
+        _onlyAdmin();
         _;
+    }
+
+    function _onlyAdmin() internal view {
+        if (msg.sender != admin) revert Errors.Unauthorized();
     }
 
     /// @notice Toggle accept-all mode.
@@ -47,17 +51,27 @@ contract MockProofAdapter is IZkApiProofAdapter {
 
     /// @inheritdoc IZkApiProofAdapter
     function assertValidRequest(
-        Types.RequestPublicInputs calldata /* inputs */,
+        Types.RequestPublicInputs calldata,
+        /* inputs */
         bytes calldata proofEnvelope
-    ) external view override {
+    )
+        external
+        view
+        override
+    {
         _assertValid(proofEnvelope);
     }
 
     /// @inheritdoc IZkApiProofAdapter
     function assertValidWithdrawal(
-        Types.WithdrawalPublicInputs calldata /* inputs */,
+        Types.WithdrawalPublicInputs calldata,
+        /* inputs */
         bytes calldata proofEnvelope
-    ) external view override {
+    )
+        external
+        view
+        override
+    {
         _assertValid(proofEnvelope);
     }
 

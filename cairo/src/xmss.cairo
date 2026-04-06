@@ -4,6 +4,6 @@
 // Merkle authentication tree for post-quantum state signatures.
 
 pub mod params;
-pub mod wots;
 pub mod tree;
 pub mod verify;
+pub mod wots;

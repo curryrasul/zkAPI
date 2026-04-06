@@ -13,6 +13,7 @@ zkapi-proof  = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 hex             = { workspace = true }
+base64          = { workspace = true }
 rand            = { workspace = true }
 uuid            = { workspace = true }
 starknet-crypto      = { workspace = true }

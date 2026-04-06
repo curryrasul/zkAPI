@@ -2,10 +2,11 @@
 pragma solidity ^0.8.28;
 
 import {Errors} from "./Errors.sol";
+import {StarkPoseidon} from "./StarkPoseidon.sol";
 
 /// @title MerkleUpdateLib – Fixed-depth binary Merkle tree helpers
-/// @notice Uses a keccak256 stub for the Poseidon node hash until a real
-///         Poseidon implementation is integrated.
+/// @notice Uses the same Starknet/Cairo-compatible Poseidon hash as the Rust
+///         and Cairo implementations.
 library MerkleUpdateLib {
     /// @notice Depth of the active-note Merkle tree.
     uint256 internal constant MERKLE_DEPTH = 32;
@@ -20,14 +21,8 @@ library MerkleUpdateLib {
     uint256 internal constant DOMAIN_NODE = 0x7a6b6170692e6e6f6465;
 
     /// @notice Compute a Merkle node hash.
-    /// @dev TODO: Replace this keccak256 stub with the actual Poseidon
-    ///      implementation that matches the Cairo program.
-    function poseidonNodeHash(
-        uint256 domain,
-        uint256 left,
-        uint256 right
-    ) internal pure returns (uint256) {
-        return uint256(keccak256(abi.encodePacked(domain, left, right))) % STARK_FIELD_PRIME;
+    function poseidonNodeHash(uint256 domain, uint256 left, uint256 right) internal pure returns (uint256) {
+        return StarkPoseidon.hash3(domain, left, right);
     }
 
     /// @notice Compute the Merkle root from a leaf and its sibling path.
@@ -35,11 +30,11 @@ library MerkleUpdateLib {
     /// @param leaf   The leaf value.
     /// @param siblings  The 32 sibling hashes from leaf to root.
     /// @return root  The computed Merkle root.
-    function computeRoot(
-        uint32 index,
-        uint256 leaf,
-        uint256[32] calldata siblings
-    ) internal pure returns (uint256 root) {
+    function computeRoot(uint32 index, uint256 leaf, uint256[32] calldata siblings)
+        internal
+        pure
+        returns (uint256 root)
+    {
         root = leaf;
         uint32 idx = index;
         for (uint256 i = 0; i < MERKLE_DEPTH; i++) {

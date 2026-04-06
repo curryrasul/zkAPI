@@ -62,8 +62,8 @@ impl XmssKeypair {
         let mut secret_keys = Vec::with_capacity(num_leaves as usize);
         for i in 0..num_leaves {
             let mut sk = [FieldElement::ZERO; WOTS_LEN];
-            for j in 0..WOTS_LEN {
-                sk[j] = poseidon_hash_many(&[
+            for (j, item) in sk.iter_mut().enumerate().take(WOTS_LEN) {
+                *item = poseidon_hash_many(&[
                     *seed,
                     FieldElement::from(i as u64),
                     FieldElement::from(j as u64),
@@ -140,7 +140,7 @@ impl XmssKeypair {
         let sig = XmssSignature {
             epoch: 0, // Caller sets this
             leaf_index: idx,
-            wots_sig: wots_sig.iter().map(|f| field_to_felt(f)).collect(),
+            wots_sig: wots_sig.iter().map(field_to_felt).collect(),
             auth_path,
         };
 
@@ -151,6 +151,11 @@ impl XmssKeypair {
     pub fn remaining(&self) -> u32 {
         let used = self.next_index.load(Ordering::SeqCst);
         (1u32 << self.height) - used
+    }
+
+    /// Peek the next unused leaf index without consuming it.
+    pub fn next_index(&self) -> u32 {
+        self.next_index.load(Ordering::SeqCst)
     }
 
     /// Check if the tree is exhausted.
@@ -177,7 +182,7 @@ impl XmssVerifier {
 
         // Recover WOTS+ public key
         let wots_sig_fields: Vec<FieldElement> =
-            sig.wots_sig.iter().map(|f| felt_to_field(f)).collect();
+            sig.wots_sig.iter().map(felt_to_field).collect();
         let mut wots_sig_arr = [FieldElement::ZERO; WOTS_LEN];
         wots_sig_arr.copy_from_slice(&wots_sig_fields);
 

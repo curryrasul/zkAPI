@@ -5,16 +5,20 @@
 //! commitment), validates constraints locally, and can emit a mock proof
 //! blob for testing.
 
+use serde::{Deserialize, Serialize};
 use zkapi_core::poseidon::FieldElement;
 use thiserror::Error;
 
+use zkapi_core::commitment::compute_state_message;
 use zkapi_core::leaf::{compute_note_leaf, compute_registration_commitment};
 use zkapi_core::merkle::verify_membership;
 use zkapi_core::nullifier::compute_nullifier;
-use zkapi_core::poseidon::field_to_felt;
+use zkapi_core::poseidon::{felt_to_field, field_to_felt};
 use zkapi_crypto::pedersen::PedersenCommitment;
+use zkapi_crypto::xmss::XmssVerifier;
 use zkapi_types::{
-    Felt252, RequestPublicInputs, GENESIS_ANCHOR, MERKLE_DEPTH, STATEMENT_TYPE_REQUEST,
+    Felt252, RequestPublicInputs, XmssSignature, GENESIS_ANCHOR, MERKLE_DEPTH,
+    STATEMENT_TYPE_REQUEST,
 };
 
 use crate::mock::MOCK_PROOF_ENVELOPE;
@@ -55,6 +59,46 @@ pub enum RequestProofError {
 
     #[error("anon commitment point is at infinity")]
     CommitmentAtInfinity,
+
+    #[error("missing non-genesis state signature")]
+    MissingStateSignature,
+
+    #[error("unexpected state signature on genesis witness")]
+    UnexpectedStateSignature,
+
+    #[error("state signature epoch mismatch: expected {expected}, got {actual}")]
+    StateSignatureEpochMismatch { expected: u32, actual: u32 },
+
+    #[error("state signature verification failed: {0}")]
+    StateSignatureInvalid(String),
+
+    #[error("proof envelope serialization failed: {0}")]
+    Serialization(String),
+
+    #[error("proof envelope public inputs do not match expected request inputs")]
+    PublicInputsMismatch,
+}
+
+/// Serialized proof envelope used by the Rust client/server pipeline.
+///
+/// The on-chain verifier boundary is still the Cairo fact/verifier adapter.
+/// Off-chain we carry the full witness so the server can re-run the same
+/// constraints before executing the request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestProofEnvelope {
+    pub public_inputs: RequestPublicInputs,
+    pub secret_s: Felt252,
+    pub note_id: u32,
+    pub deposit_amount: u128,
+    pub expiry_ts: u64,
+    pub merkle_siblings: [Felt252; MERKLE_DEPTH],
+    pub current_balance: u128,
+    pub current_blinding: Felt252,
+    pub user_rerandomization: Felt252,
+    pub current_anchor: Felt252,
+    pub is_genesis: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_sig: Option<XmssSignature>,
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +288,82 @@ impl RequestProofBuilder {
         Ok(())
     }
 
+    /// Run all local checks including XMSS verification for non-genesis notes.
+    pub fn validate_with_signature(
+        &self,
+        state_sig: Option<&XmssSignature>,
+    ) -> Result<(), RequestProofError> {
+        self.validate()?;
+
+        if self.is_genesis {
+            if state_sig.is_some() {
+                return Err(RequestProofError::UnexpectedStateSignature);
+            }
+            return Ok(());
+        }
+
+        let sig = state_sig.ok_or(RequestProofError::MissingStateSignature)?;
+        if sig.epoch != self.state_sig_epoch {
+            return Err(RequestProofError::StateSignatureEpochMismatch {
+                expected: self.state_sig_epoch,
+                actual: sig.epoch,
+            });
+        }
+        sig.validate()
+            .map_err(RequestProofError::StateSignatureInvalid)?;
+
+        let commitment = PedersenCommitment::commit(self.current_balance, &self.current_blinding);
+        let (current_x, current_y) = commitment.to_affine();
+        let state_msg = compute_state_message(
+            self.protocol_version,
+            self.chain_id,
+            &self.contract_address,
+            &field_to_felt(&current_x),
+            &field_to_felt(&current_y),
+            &self.current_anchor,
+        );
+        if !XmssVerifier::verify(&self.state_sig_root, &state_msg, sig) {
+            return Err(RequestProofError::StateSignatureInvalid(
+                "XMSS root/path verification failed".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Build a serialized witness envelope that the server can verify.
+    pub fn build_envelope(
+        &self,
+        state_sig: Option<&XmssSignature>,
+    ) -> Result<RequestProofEnvelope, RequestProofError> {
+        self.validate_with_signature(state_sig)?;
+
+        Ok(RequestProofEnvelope {
+            public_inputs: self.build_public_inputs()?,
+            secret_s: self.secret_s,
+            note_id: self.note_id,
+            deposit_amount: self.deposit_amount,
+            expiry_ts: self.expiry_ts,
+            merkle_siblings: self.merkle_siblings,
+            current_balance: self.current_balance,
+            current_blinding: field_to_felt(&self.current_blinding),
+            user_rerandomization: field_to_felt(&self.user_rerandomization),
+            current_anchor: self.current_anchor,
+            is_genesis: self.is_genesis,
+            state_sig: state_sig.cloned(),
+        })
+    }
+
+    /// Serialize the proof envelope as JSON bytes.
+    pub fn generate_proof(
+        &self,
+        state_sig: Option<&XmssSignature>,
+    ) -> Result<Vec<u8>, RequestProofError> {
+        let envelope = self.build_envelope(state_sig)?;
+        serde_json::to_vec(&envelope)
+            .map_err(|e| RequestProofError::Serialization(e.to_string()))
+    }
+
     // -- mock proof ----------------------------------------------------
 
     /// Produce a mock proof blob for testing.
@@ -254,10 +374,51 @@ impl RequestProofBuilder {
     }
 }
 
+/// Verify a serialized request proof envelope against expected public inputs.
+pub fn verify_request_proof(
+    proof: &[u8],
+    expected_inputs: &RequestPublicInputs,
+) -> Result<(), RequestProofError> {
+    let envelope: RequestProofEnvelope = serde_json::from_slice(proof)
+        .map_err(|e| RequestProofError::Serialization(e.to_string()))?;
+    if &envelope.public_inputs != expected_inputs {
+        return Err(RequestProofError::PublicInputsMismatch);
+    }
+
+    let builder = RequestProofBuilder::new(
+        envelope.secret_s,
+        envelope.note_id,
+        envelope.deposit_amount,
+        envelope.expiry_ts,
+        envelope.merkle_siblings,
+        envelope.current_balance,
+        felt_to_field(&envelope.current_blinding),
+        felt_to_field(&envelope.user_rerandomization),
+        envelope.current_anchor,
+        envelope.is_genesis,
+        expected_inputs.state_sig_epoch,
+        expected_inputs.state_sig_root,
+        expected_inputs.active_root,
+        expected_inputs.protocol_version,
+        expected_inputs.chain_id,
+        expected_inputs.contract_address,
+        expected_inputs.solvency_bound,
+    );
+
+    let rebuilt_inputs = builder.build_public_inputs()?;
+    if &rebuilt_inputs != expected_inputs {
+        return Err(RequestProofError::PublicInputsMismatch);
+    }
+
+    builder.validate_with_signature(envelope.state_sig.as_ref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zkapi_core::commitment::compute_state_message;
     use zkapi_core::merkle::MerkleTree;
+    use zkapi_crypto::xmss::XmssKeypair;
 
     /// Helper: build a minimal genesis witness that should pass validation.
     fn genesis_builder() -> RequestProofBuilder {
@@ -374,5 +535,36 @@ mod tests {
         builder.current_anchor = Felt252::from_u64(99);
         let err = builder.validate().unwrap_err();
         assert!(matches!(err, RequestProofError::NonGenesisRootZero));
+    }
+
+    #[test]
+    fn test_real_proof_roundtrip_non_genesis() {
+        let mut builder = genesis_builder();
+        builder.is_genesis = false;
+        builder.current_balance = 900;
+        builder.current_blinding = FieldElement::from(9u64);
+        builder.user_rerandomization = FieldElement::from(7u64);
+        builder.current_anchor = Felt252::from_u64(55);
+
+        let keypair = XmssKeypair::generate_with_height(&FieldElement::from(123u64), 4);
+        builder.state_sig_epoch = 7;
+        builder.state_sig_root = keypair.root_felt();
+
+        let commitment = PedersenCommitment::commit(builder.current_balance, &builder.current_blinding);
+        let (cx, cy) = commitment.to_affine();
+        let state_msg = compute_state_message(
+            builder.protocol_version,
+            builder.chain_id,
+            &builder.contract_address,
+            &field_to_felt(&cx),
+            &field_to_felt(&cy),
+            &builder.current_anchor,
+        );
+        let (mut sig, _) = keypair.sign(&state_msg).unwrap();
+        sig.epoch = builder.state_sig_epoch;
+
+        let public_inputs = builder.build_public_inputs().unwrap();
+        let proof = builder.generate_proof(Some(&sig)).unwrap();
+        verify_request_proof(&proof, &public_inputs).unwrap();
     }
 }

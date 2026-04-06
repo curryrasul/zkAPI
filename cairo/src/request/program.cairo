@@ -6,8 +6,8 @@
 // a serialized array of felt252 values.
 
 use core::poseidon::poseidon_hash_span;
-use zkapi_cairo::constants::{PROTOCOL_VERSION, GENESIS_ANCHOR, STATEMENT_TYPE_REQUEST};
-use zkapi_cairo::domains::{DOMAIN_REG, DOMAIN_LEAF, DOMAIN_NULL, DOMAIN_STATE};
+use zkapi_cairo::constants::{GENESIS_ANCHOR, PROTOCOL_VERSION, STATEMENT_TYPE_REQUEST};
+use zkapi_cairo::domains::{DOMAIN_LEAF, DOMAIN_NULL, DOMAIN_REG, DOMAIN_STATE};
 use zkapi_cairo::merkle::verify_merkle_path;
 use zkapi_cairo::pedersen_balance::compute_commitment;
 use zkapi_cairo::xmss::verify::verify_xmss;
@@ -104,12 +104,7 @@ pub fn run_request_program(
         //                    contract_address, E_x, E_y, current_anchor)
         let m_state = poseidon_hash_span(
             array![
-                DOMAIN_STATE,
-                protocol_version,
-                chain_id,
-                contract_address,
-                e_x,
-                e_y,
+                DOMAIN_STATE, protocol_version, chain_id, contract_address, e_x, e_y,
                 current_anchor,
             ]
                 .span(),
@@ -149,17 +144,77 @@ pub fn run_request_program(
     let state_sig_epoch_felt: felt252 = state_sig_epoch.into();
 
     array![
-        STATEMENT_TYPE_REQUEST,
-        protocol_version,
-        chain_id,
-        contract_address,
-        active_root,
-        state_sig_epoch_felt,
-        state_sig_root,
-        request_nullifier,
-        anon_x,
-        anon_y,
-        expiry_ts,
+        STATEMENT_TYPE_REQUEST, protocol_version, chain_id, contract_address, active_root,
+        state_sig_epoch_felt, state_sig_root, request_nullifier, anon_x, anon_y, expiry_ts,
         solvency_bound,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use core::poseidon::poseidon_hash_span;
+    use zkapi_cairo::domains::{DOMAIN_LEAF, DOMAIN_NODE, DOMAIN_REG};
+    use super::run_request_program;
+
+    fn zero_path_for_leaf(leaf: felt252) -> (Array<felt252>, Array<felt252>, felt252) {
+        let mut index_bits = array![];
+        let mut siblings = array![];
+        let mut zero = 0;
+        let mut current = leaf;
+        let mut i: u32 = 0;
+        loop {
+            if i == 32 {
+                break;
+            }
+            index_bits.append(0);
+            siblings.append(zero);
+            current = poseidon_hash_span(array![DOMAIN_NODE, current, zero].span());
+            zero = poseidon_hash_span(array![DOMAIN_NODE, zero, zero].span());
+            i += 1;
+        }
+        (index_bits, siblings, current)
+    }
+
+    #[test]
+    fn test_run_request_program_genesis() {
+        let secret_s = 42;
+        let note_id = 0;
+        let deposit_amount = 1000;
+        let expiry_ts = 1700000000;
+        let commitment = poseidon_hash_span(array![DOMAIN_REG, secret_s, 0].span());
+        let leaf = poseidon_hash_span(
+            array![DOMAIN_LEAF, note_id, commitment, deposit_amount, expiry_ts].span(),
+        );
+        let (index_bits, siblings, active_root) = zero_path_for_leaf(leaf);
+
+        let outputs = run_request_program(
+            1,
+            1,
+            0xdead,
+            active_root,
+            100,
+            secret_s,
+            note_id,
+            deposit_amount,
+            expiry_ts,
+            index_bits.span(),
+            siblings.span(),
+            deposit_amount,
+            0,
+            7,
+            1,
+            1,
+            0,
+            0,
+            0,
+            array![].span(),
+            array![].span(),
+        );
+
+        let outputs_span = outputs.span();
+        assert(*outputs_span.at(0) == 1, 'statement type');
+        assert(*outputs_span.at(4) == active_root, 'root mismatch');
+        assert(*outputs_span.at(10) == expiry_ts, 'expiry mismatch');
+        assert(*outputs_span.at(11) == 100, 'solvency mismatch');
+    }
 }

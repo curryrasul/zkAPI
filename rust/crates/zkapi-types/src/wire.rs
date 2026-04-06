@@ -32,6 +32,7 @@ pub struct RequestResponse {
     pub next_anchor: Felt252,
     pub blind_delta_srv: Felt252,
     pub next_state_sig_epoch: u32,
+    pub next_state_sig_root: Felt252,
     pub next_state_sig: crate::XmssSignature,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_reason_code: Option<u32>,
@@ -75,6 +76,7 @@ pub struct ClearanceResponse {
     pub status: String,
     pub withdrawal_nullifier: Felt252,
     pub clear_sig_epoch: u32,
+    pub clear_sig_root: Felt252,
     pub clear_sig: crate::XmssSignature,
 }
 

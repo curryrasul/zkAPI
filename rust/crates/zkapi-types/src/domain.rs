@@ -89,12 +89,12 @@ mod tests {
 
     #[test]
     fn test_all_tags_unique() {
-        for i in 0..DOMAIN_TAGS.len() {
-            for j in (i + 1)..DOMAIN_TAGS.len() {
+        for (i, tag_i) in DOMAIN_TAGS.iter().enumerate() {
+            for tag_j in DOMAIN_TAGS.iter().skip(i + 1) {
                 assert_ne!(
-                    DOMAIN_TAGS[i].felt, DOMAIN_TAGS[j].felt,
+                    tag_i.felt, tag_j.felt,
                     "duplicate domain tag: {} and {}",
-                    DOMAIN_TAGS[i].label, DOMAIN_TAGS[j].label
+                    tag_i.label, tag_j.label
                 );
             }
         }

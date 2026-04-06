@@ -10,15 +10,11 @@ import {Types} from "../libraries/Types.sol";
 interface IZkApiProofAdapter {
     /// @notice Assert that a request proof is valid for the given public inputs.
     /// @dev Must revert if the proof is invalid.
-    function assertValidRequest(
-        Types.RequestPublicInputs calldata inputs,
-        bytes calldata proofEnvelope
-    ) external view;
+    function assertValidRequest(Types.RequestPublicInputs calldata inputs, bytes calldata proofEnvelope) external view;
 
     /// @notice Assert that a withdrawal proof is valid for the given public inputs.
     /// @dev Must revert if the proof is invalid.
-    function assertValidWithdrawal(
-        Types.WithdrawalPublicInputs calldata inputs,
-        bytes calldata proofEnvelope
-    ) external view;
+    function assertValidWithdrawal(Types.WithdrawalPublicInputs calldata inputs, bytes calldata proofEnvelope)
+        external
+        view;
 }

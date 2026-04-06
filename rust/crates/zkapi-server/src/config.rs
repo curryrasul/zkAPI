@@ -23,6 +23,16 @@ pub struct ServerConfig {
     pub db_path: String,
     /// Timeout in milliseconds for recovery of reserved-but-unfinalized entries.
     pub recovery_timeout_ms: u64,
+    /// Seed for the state-signing XMSS tree.
+    pub state_seed: Felt252,
+    /// Seed for the clearance-signing XMSS tree.
+    pub clear_seed: Felt252,
+    /// Published XMSS epoch served by this process.
+    pub epoch: u32,
+    /// XMSS tree height.
+    pub xmss_height: usize,
+    /// Initial Merkle root the server should accept until the indexer updates it.
+    pub initial_root: Felt252,
 }
 
 impl Default for ServerConfig {
@@ -37,6 +47,11 @@ impl Default for ServerConfig {
             listen_addr: "0.0.0.0:3000".to_string(),
             db_path: "zkapi_server.db".to_string(),
             recovery_timeout_ms: 30_000,
+            state_seed: Felt252::from_u64(1),
+            clear_seed: Felt252::from_u64(2),
+            epoch: 1,
+            xmss_height: zkapi_types::XMSS_TREE_HEIGHT,
+            initial_root: Felt252::ZERO,
         }
     }
 }

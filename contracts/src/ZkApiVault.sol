@@ -105,8 +105,12 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
     // -----------------------------------------------------------------------
 
     modifier whenNotPaused() {
-        if (paused) revert Errors.Paused();
+        _whenNotPaused();
         _;
+    }
+
+    function _whenNotPaused() internal view {
+        if (paused) revert Errors.Paused();
     }
 
     // -----------------------------------------------------------------------
@@ -153,11 +157,11 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
     /// @param commitment  Registration commitment C (must be < STARK_FIELD_PRIME and != 0).
     /// @param amount      Deposit amount in token base units (must be > 0).
     /// @param siblings    Merkle sibling path for the new note's leaf slot.
-    function deposit(
-        bytes32 commitment,
-        uint128 amount,
-        uint256[32] calldata siblings
-    ) external nonReentrant whenNotPaused {
+    function deposit(bytes32 commitment, uint128 amount, uint256[32] calldata siblings)
+        external
+        nonReentrant
+        whenNotPaused
+    {
         if (amount == 0) revert Errors.ZeroAmount();
         if (commitment == bytes32(0)) revert Errors.InvalidCommitment();
         if (uint256(commitment) >= MerkleUpdateLib.STARK_FIELD_PRIME) revert Errors.InvalidFelt();
@@ -180,10 +184,7 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
         // Effects
         currentRoot = newRoot;
         notes[noteId] = Types.Note({
-            commitment: commitment,
-            depositAmount: amount,
-            expiryTs: expiryTs,
-            status: Types.NoteStatus.Active
+            commitment: commitment, depositAmount: amount, expiryTs: expiryTs, status: Types.NoteStatus.Active
         });
         nextNoteId = noteId + 1;
 
@@ -236,12 +237,7 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
         usedNullifiers[inputs.withdrawalNullifier] = true;
 
         // Compute the old leaf and zero it out
-        uint256 oldLeaf = NoteLeafLib.computeLeaf(
-            noteId,
-            note.commitment,
-            note.depositAmount,
-            note.expiryTs
-        );
+        uint256 oldLeaf = NoteLeafLib.computeLeaf(noteId, note.commitment, note.depositAmount, note.expiryTs);
         uint256 newRoot = MerkleUpdateLib.verifyAndUpdate(
             currentRoot,
             noteId,
@@ -311,19 +307,8 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
         usedNullifiers[inputs.withdrawalNullifier] = true;
 
         // Compute old leaf and zero it immediately to freeze the note
-        uint256 oldLeaf = NoteLeafLib.computeLeaf(
-            noteId,
-            note.commitment,
-            note.depositAmount,
-            note.expiryTs
-        );
-        uint256 newRoot = MerkleUpdateLib.verifyAndUpdate(
-            currentRoot,
-            noteId,
-            oldLeaf,
-            0,
-            siblings
-        );
+        uint256 oldLeaf = NoteLeafLib.computeLeaf(noteId, note.commitment, note.depositAmount, note.expiryTs);
+        uint256 newRoot = MerkleUpdateLib.verifyAndUpdate(currentRoot, noteId, oldLeaf, 0, siblings);
 
         uint64 challengeDeadline = uint64(block.timestamp) + CHALLENGE_PERIOD;
 
@@ -339,12 +324,7 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
         });
 
         emit EscapeWithdrawalInitiated(
-            noteId,
-            inputs.withdrawalNullifier,
-            inputs.finalBalance,
-            inputs.destination,
-            challengeDeadline,
-            newRoot
+            noteId, inputs.withdrawalNullifier, inputs.finalBalance, inputs.destination, challengeDeadline, newRoot
         );
     }
 
@@ -392,12 +372,7 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
 
         // The current root should have zero at the note leaf (it was zeroed during initiation).
         // Restore the original leaf.
-        uint256 originalLeaf = NoteLeafLib.computeLeaf(
-            noteId,
-            note.commitment,
-            note.depositAmount,
-            note.expiryTs
-        );
+        uint256 originalLeaf = NoteLeafLib.computeLeaf(noteId, note.commitment, note.depositAmount, note.expiryTs);
         uint256 restoredRoot = MerkleUpdateLib.verifyAndUpdate(
             currentRoot,
             noteId,
@@ -413,9 +388,6 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
         // Clear pending withdrawal data
         uint256 nullifier = pending.withdrawalNullifier;
         delete pendingWithdrawals[noteId];
-
-        // Un-consume the nullifier so the user can attempt a proper withdrawal later
-        usedNullifiers[nullifier] = false;
 
         emit EscapeWithdrawalChallenged(noteId, nullifier, restoredRoot);
     }
@@ -464,10 +436,7 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
     /// @notice Claim an expired note's deposit for the treasury.
     /// @param noteId   The expired note.
     /// @param siblings Merkle sibling path.
-    function claimExpired(
-        uint32 noteId,
-        uint256[32] calldata siblings
-    ) external nonReentrant whenNotPaused {
+    function claimExpired(uint32 noteId, uint256[32] calldata siblings) external nonReentrant whenNotPaused {
         Types.Note storage note = notes[noteId];
 
         // Note must be active
@@ -477,19 +446,8 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
         if (block.timestamp < note.expiryTs) revert Errors.NoteNotExpired();
 
         // Zero the leaf
-        uint256 oldLeaf = NoteLeafLib.computeLeaf(
-            noteId,
-            note.commitment,
-            note.depositAmount,
-            note.expiryTs
-        );
-        uint256 newRoot = MerkleUpdateLib.verifyAndUpdate(
-            currentRoot,
-            noteId,
-            oldLeaf,
-            0,
-            siblings
-        );
+        uint256 oldLeaf = NoteLeafLib.computeLeaf(noteId, note.commitment, note.depositAmount, note.expiryTs);
+        uint256 newRoot = MerkleUpdateLib.verifyAndUpdate(currentRoot, noteId, oldLeaf, 0, siblings);
 
         uint128 depositAmount = note.depositAmount;
 
@@ -534,11 +492,7 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
     /// @param epoch     The new epoch number.
     /// @param stateRoot The state-signature XMSS root for this epoch.
     /// @param clearRoot The clearance-signature XMSS root for this epoch.
-    function rotateServerRoots(
-        uint32 epoch,
-        uint256 stateRoot,
-        uint256 clearRoot
-    ) external onlyOwner {
+    function rotateServerRoots(uint32 epoch, uint256 stateRoot, uint256 clearRoot) external onlyOwner {
         // Epoch must be strictly greater than the current epoch
         // (also prevents re-registration of an existing epoch)
         if (epoch <= currentEpoch && currentEpoch != 0) revert Errors.EpochNotFound();
@@ -575,11 +529,7 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
 
     /// @dev Validate the state-signature root for a withdrawal or request.
     ///      When isGenesis is true, epoch and root checks are skipped.
-    function _validateStateSigRoot(
-        bool isGenesis,
-        uint32 epoch,
-        uint256 root
-    ) internal view {
+    function _validateStateSigRoot(bool isGenesis, uint32 epoch, uint256 root) internal view {
         if (isGenesis) return;
         uint256 storedRoot = stateSigRootByEpoch[epoch];
         if (storedRoot == 0) revert Errors.EpochNotFound();
@@ -598,11 +548,7 @@ contract ZkApiVault is ReentrancyGuard, Ownable, Events {
     function _computeEmptyTreeRoot() internal pure returns (uint256) {
         uint256 node = 0;
         for (uint256 i = 0; i < MerkleUpdateLib.MERKLE_DEPTH; i++) {
-            node = MerkleUpdateLib.poseidonNodeHash(
-                MerkleUpdateLib.DOMAIN_NODE,
-                node,
-                node
-            );
+            node = MerkleUpdateLib.poseidonNodeHash(MerkleUpdateLib.DOMAIN_NODE, node, node);
         }
         return node;
     }

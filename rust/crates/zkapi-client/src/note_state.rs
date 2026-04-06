@@ -32,6 +32,7 @@ pub struct NoteState {
     pub current_anchor: Felt252,
     pub is_genesis: bool,
     pub state_sig_epoch: Option<u32>,
+    pub state_sig_root: Option<Felt252>,
     pub state_sig: Option<XmssSignature>,
 }
 
@@ -40,6 +41,7 @@ impl NoteState {
     ///
     /// The initial balance equals the deposit amount, the anchor is 1 (genesis),
     /// and no state signature exists yet.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_from_deposit(
         protocol_version: u16,
         chain_id: u64,
@@ -67,6 +69,7 @@ impl NoteState {
             current_anchor: Felt252::ONE, // genesis anchor
             is_genesis: true,
             state_sig_epoch: None,
+            state_sig_root: None,
             state_sig: None,
         }
     }

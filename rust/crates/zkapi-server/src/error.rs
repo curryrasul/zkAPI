@@ -5,8 +5,8 @@ use thiserror::Error;
 /// Errors that can occur during server-side request processing.
 #[derive(Error, Debug)]
 pub enum ServerError {
-    #[error("invalid proof")]
-    InvalidProof,
+    #[error("invalid proof: {0}")]
+    InvalidProof(String),
 
     #[error("stale root: latest is {latest_root}")]
     StaleRoot { latest_root: String },
@@ -40,7 +40,7 @@ impl ServerError {
     /// Return a machine-readable error code string for the error.
     pub fn error_code(&self) -> &str {
         match self {
-            ServerError::InvalidProof => "INVALID_PROOF",
+            ServerError::InvalidProof(_) => "INVALID_PROOF",
             ServerError::StaleRoot { .. } => "STALE_ROOT",
             ServerError::Replay => "REPLAY",
             ServerError::NoteExpired => "NOTE_EXPIRED",
@@ -59,7 +59,7 @@ impl ServerError {
             ServerError::StaleRoot { .. } => true,
             ServerError::Internal(_) => true,
             ServerError::Database(_) => true,
-            ServerError::InvalidProof => false,
+            ServerError::InvalidProof(_) => false,
             ServerError::Replay => false,
             ServerError::NoteExpired => false,
             ServerError::CapacityExhausted => false,

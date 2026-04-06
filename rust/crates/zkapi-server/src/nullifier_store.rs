@@ -27,6 +27,7 @@ pub struct TranscriptRecord {
     pub next_anchor: Option<Felt252>,
     pub blind_delta_srv: Option<Felt252>,
     pub next_state_sig_epoch: Option<u32>,
+    pub next_state_sig_root: Option<Felt252>,
     pub next_state_sig: Option<XmssSignature>,
     pub policy_reason_code: Option<u32>,
     pub policy_evidence_hash: Option<Felt252>,
@@ -61,6 +62,7 @@ impl NullifierStore {
                 next_anchor TEXT,
                 blind_delta_srv TEXT,
                 next_state_sig_epoch INTEGER,
+                next_state_sig_root TEXT,
                 next_state_sig_json TEXT,
                 policy_reason_code INTEGER,
                 policy_evidence_hash TEXT,
@@ -71,6 +73,11 @@ impl NullifierStore {
             );",
         )
         .map_err(|e| ServerError::Database(format!("failed to create table: {}", e)))?;
+
+        let _ = conn.execute(
+            "ALTER TABLE nullifiers ADD COLUMN next_state_sig_root TEXT",
+            [],
+        );
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -148,13 +155,14 @@ impl NullifierStore {
                     next_anchor = ?7,
                     blind_delta_srv = ?8,
                     next_state_sig_epoch = ?9,
-                    next_state_sig_json = ?10,
-                    policy_reason_code = ?11,
-                    policy_evidence_hash = ?12,
-                    proof_blob = ?13,
-                    request_inputs_json = ?14,
-                    finalized_at = ?15
-                 WHERE nullifier = ?16 AND status = ?17",
+                    next_state_sig_root = ?10,
+                    next_state_sig_json = ?11,
+                    policy_reason_code = ?12,
+                    policy_evidence_hash = ?13,
+                    proof_blob = ?14,
+                    request_inputs_json = ?15,
+                    finalized_at = ?16
+                 WHERE nullifier = ?17 AND status = ?18",
                 params![
                     status_to_str(NullifierStatus::Finalized),
                     transcript.charge_applied.map(|c| c as i64),
@@ -165,6 +173,7 @@ impl NullifierStore {
                     transcript.next_anchor.map(|a| a.to_hex()),
                     transcript.blind_delta_srv.map(|b| b.to_hex()),
                     transcript.next_state_sig_epoch.map(|e| e as i32),
+                    transcript.next_state_sig_root.map(|r| r.to_hex()),
                     sig_json,
                     transcript.policy_reason_code.map(|c| c as i32),
                     transcript.policy_evidence_hash.map(|h| h.to_hex()),
@@ -194,7 +203,7 @@ impl NullifierStore {
         conn.query_row(
             "SELECT * FROM nullifiers WHERE nullifier = ?1",
             params![null_hex],
-            |row| row_to_record(row),
+            row_to_record,
         )
         .optional()
         .ok()
@@ -208,7 +217,7 @@ impl NullifierStore {
         conn.query_row(
             "SELECT * FROM nullifiers WHERE client_request_id = ?1",
             params![client_request_id],
-            |row| row_to_record(row),
+            row_to_record,
         )
         .optional()
         .ok()
@@ -260,7 +269,7 @@ impl NullifierStore {
 
         let rows = match stmt.query_map(
             params![status_to_str(NullifierStatus::Reserved)],
-            |row| row_to_record(row),
+            row_to_record,
         ) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
@@ -281,7 +290,7 @@ impl NullifierStore {
             Err(_) => return Vec::new(),
         };
 
-        let rows = match stmt.query_map([], |row| row_to_record(row)) {
+        let rows = match stmt.query_map([], row_to_record) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
         };
@@ -328,6 +337,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRecord> 
     let next_anchor: Option<String> = row.get("next_anchor")?;
     let blind_delta_srv: Option<String> = row.get("blind_delta_srv")?;
     let next_state_sig_epoch: Option<i32> = row.get("next_state_sig_epoch")?;
+    let next_state_sig_root: Option<String> = row.get("next_state_sig_root")?;
     let next_state_sig_json: Option<String> = row.get("next_state_sig_json")?;
     let policy_reason_code: Option<i32> = row.get("policy_reason_code")?;
     let policy_evidence_hash: Option<String> = row.get("policy_evidence_hash")?;
@@ -352,6 +362,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRecord> 
         next_anchor: parse_opt_felt(next_anchor),
         blind_delta_srv: parse_opt_felt(blind_delta_srv),
         next_state_sig_epoch: next_state_sig_epoch.map(|e| e as u32),
+        next_state_sig_root: parse_opt_felt(next_state_sig_root),
         next_state_sig,
         policy_reason_code: policy_reason_code.map(|c| c as u32),
         policy_evidence_hash: parse_opt_felt(policy_evidence_hash),
@@ -430,6 +441,7 @@ mod tests {
             next_anchor: Some(Felt252::from_u64(30)),
             blind_delta_srv: Some(Felt252::from_u64(40)),
             next_state_sig_epoch: Some(1),
+            next_state_sig_root: Some(Felt252::from_u64(50)),
             next_state_sig: None,
             policy_reason_code: None,
             policy_evidence_hash: None,

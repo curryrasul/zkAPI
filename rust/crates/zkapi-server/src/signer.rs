@@ -95,8 +95,18 @@ impl ServerSigner {
         self.state_keypair.remaining()
     }
 
+    /// Peek the next state-signature leaf index.
+    pub fn state_next_index(&self) -> u32 {
+        self.state_keypair.next_index()
+    }
+
     /// Check remaining clearance signatures.
     pub fn clear_remaining(&self) -> u32 {
         self.clear_keypair.remaining()
+    }
+
+    /// Peek the next clearance-signature leaf index.
+    pub fn clear_next_index(&self) -> u32 {
+        self.clear_keypair.next_index()
     }
 }

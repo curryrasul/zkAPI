@@ -28,11 +28,11 @@ pub fn compute_zero_hashes() -> [Felt252; MERKLE_DEPTH + 1] {
 pub fn compute_root(index: u32, leaf: &Felt252, siblings: &[Felt252; MERKLE_DEPTH]) -> Felt252 {
     let mut current = *leaf;
     let mut idx = index;
-    for i in 0..MERKLE_DEPTH {
+    for sibling in siblings.iter().take(MERKLE_DEPTH) {
         if idx & 1 == 0 {
-            current = poseidon_hash(&DOMAIN_NODE, &current, &siblings[i]);
+            current = poseidon_hash(&DOMAIN_NODE, &current, sibling);
         } else {
-            current = poseidon_hash(&DOMAIN_NODE, &siblings[i], &current);
+            current = poseidon_hash(&DOMAIN_NODE, sibling, &current);
         }
         idx >>= 1;
     }
@@ -128,9 +128,9 @@ impl MerkleTree {
     pub fn get_siblings(&self, index: u32) -> [Felt252; MERKLE_DEPTH] {
         let mut siblings = [Felt252::ZERO; MERKLE_DEPTH];
         let mut idx = index;
-        for level in 0..MERKLE_DEPTH {
+        for (level, sibling) in siblings.iter_mut().enumerate().take(MERKLE_DEPTH) {
             let sibling_idx = idx ^ 1;
-            siblings[level] = self.get_node(level, sibling_idx);
+            *sibling = self.get_node(level, sibling_idx);
             idx /= 2;
         }
         siblings

@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Felt252, WOTS_LEN, XMSS_TREE_HEIGHT};
+use crate::{Felt252, WOTS_LEN};
 
 /// An XMSS signature consisting of a WOTS+ one-time signature
 /// and a Merkle authentication path.

@@ -8,9 +8,8 @@ import {ZkApiVault} from "../src/ZkApiVault.sol";
 import {MockProofAdapter} from "../src/adapters/MockProofAdapter.sol";
 import {Types} from "../src/libraries/Types.sol";
 import {Errors} from "../src/libraries/Errors.sol";
-// MerkleUpdateLib and NoteLeafLib constants are replicated locally in the test
-// to avoid "unused import" warnings; we re-implement the hash functions below.
 import {Events} from "../src/libraries/Events.sol";
+import {StarkPoseidon} from "../src/libraries/StarkPoseidon.sol";
 
 /// @title ZkApiVaultTest - Comprehensive Foundry tests for ZkApiVault
 /// @notice Covers all scenarios from spec section 13.2
@@ -19,8 +18,7 @@ contract ZkApiVaultTest is Test, Events {
     //  Constants
     // -----------------------------------------------------------------------
 
-    uint256 constant STARK_FIELD_PRIME =
-        3618502788666131213697322783095070105623107215331596699973092056135872020481;
+    uint256 constant STARK_FIELD_PRIME = 3618502788666131213697322783095070105623107215331596699973092056135872020481;
     uint256 constant DOMAIN_NODE = 0x7a6b6170692e6e6f6465;
     uint256 constant DOMAIN_LEAF = 0x7a6b6170692e6c656166;
     uint256 constant MERKLE_DEPTH = 32;
@@ -97,40 +95,26 @@ contract ZkApiVaultTest is Test, Events {
     //  Helpers: Merkle
     // -----------------------------------------------------------------------
 
-    function _poseidonNodeHash(
-        uint256 domain,
-        uint256 left,
-        uint256 right
-    ) internal pure returns (uint256) {
-        return uint256(keccak256(abi.encodePacked(domain, left, right))) % STARK_FIELD_PRIME;
+    function _poseidonNodeHash(uint256 domain, uint256 left, uint256 right) internal pure returns (uint256) {
+        return StarkPoseidon.hash3(domain, left, right);
     }
 
-    function _computeLeaf(
-        uint32 noteId,
-        bytes32 commitment,
-        uint128 depositAmount,
-        uint64 expiryTs
-    ) internal pure returns (uint256) {
-        return
-            uint256(
-                keccak256(
-                    abi.encodePacked(
-                        DOMAIN_LEAF,
-                        uint256(noteId),
-                        uint256(commitment),
-                        uint256(depositAmount),
-                        uint256(expiryTs)
-                    )
-                )
-            ) % STARK_FIELD_PRIME;
+    function _computeLeaf(uint32 noteId, bytes32 commitment, uint128 depositAmount, uint64 expiryTs)
+        internal
+        pure
+        returns (uint256)
+    {
+        return StarkPoseidon.hash5(
+            DOMAIN_LEAF, uint256(noteId), uint256(commitment), uint256(depositAmount), uint256(expiryTs)
+        );
     }
 
     /// @dev Compute Merkle root from leaf, index, and siblings.
-    function _computeRoot(
-        uint32 index,
-        uint256 leaf,
-        uint256[32] memory siblings
-    ) internal pure returns (uint256 root) {
+    function _computeRoot(uint32 index, uint256 leaf, uint256[32] memory siblings)
+        internal
+        pure
+        returns (uint256 root)
+    {
         root = leaf;
         uint32 idx = index;
         for (uint256 i = 0; i < MERKLE_DEPTH; i++) {
@@ -150,7 +134,13 @@ contract ZkApiVaultTest is Test, Events {
     ///
     ///      NOTE: This only works correctly for small note counts used in tests.
     ///      For index 0 in an empty tree, the siblings are just emptySiblings.
-    function _siblingsForEmptySlot(uint32 /* index */) internal view returns (uint256[32] memory sibs) {
+    function _siblingsForEmptySlot(
+        uint32 /* index */
+    )
+        internal
+        view
+        returns (uint256[32] memory sibs)
+    {
         // For index 0 in a pristine tree, siblings are the empty tree levels.
         // This is the only case we need for single-deposit tests.
         // For multi-deposit tests we track the root after each deposit.
@@ -166,12 +156,25 @@ contract ZkApiVaultTest is Test, Events {
     ///
     ///      For the same index, siblings remain the same because we only changed
     ///      the leaf at that index, not any sibling subtree.
-    function _siblingsAfterInsert(
-        uint256[32] memory oldSiblings
-    ) internal pure returns (uint256[32] memory) {
+    function _siblingsAfterInsert(uint256[32] memory oldSiblings) internal pure returns (uint256[32] memory) {
         // Siblings for a given index remain constant regardless of the leaf value
         // at that index. They only change if OTHER leaves in sibling subtrees change.
         return oldSiblings;
+    }
+
+    // -----------------------------------------------------------------------
+    //  Hash Sanity
+    // -----------------------------------------------------------------------
+
+    function test_poseidon_vectors() public pure {
+        assertEq(
+            StarkPoseidon.hash2(
+                0x03d937c035c878245caf64531a5756109c53068da139362728feb561405371cb,
+                0x0208a0a10250e382e1e4bbe2880906c2791bf6275695e02fbbc6aeff9cd8b31a
+            ),
+            0x067c6a2e2d0c7867f97444ae17956dbc89d40ad22255bb06f5f6c515958926ed
+        );
+        assertEq(StarkPoseidon.hash3(1, 2, 3), 0x02f0d8840bcf3bc629598d8a6cc80cb7c0d9e52d93dab244bbf9cd0dca0ad082);
     }
 
     // -----------------------------------------------------------------------
@@ -185,51 +188,47 @@ contract ZkApiVaultTest is Test, Events {
         bool hasClearance,
         bool isGenesis
     ) internal view returns (Types.WithdrawalPublicInputs memory) {
-        return
-            Types.WithdrawalPublicInputs({
-                statementType: 2,
-                protocolVersion: 1,
-                chainId: uint64(block.chainid),
-                contractAddress: address(vault),
-                activeRoot: vault.currentRoot(),
-                noteId: noteId,
-                finalBalance: finalBalance,
-                destination: dest,
-                withdrawalNullifier: uint256(keccak256(abi.encodePacked("nullifier", noteId, finalBalance))),
-                isGenesis: isGenesis,
-                hasClearance: hasClearance,
-                stateSigEpoch: isGenesis ? 0 : uint32(1),
-                stateSigRoot: isGenesis ? 0 : uint256(0xABCD),
-                clearSigEpoch: hasClearance ? uint32(1) : uint32(0),
-                clearSigRoot: hasClearance ? uint256(0x1234) : uint256(0)
-            });
+        return Types.WithdrawalPublicInputs({
+            statementType: 2,
+            protocolVersion: 1,
+            chainId: uint64(block.chainid),
+            contractAddress: address(vault),
+            activeRoot: vault.currentRoot(),
+            noteId: noteId,
+            finalBalance: finalBalance,
+            destination: dest,
+            withdrawalNullifier: uint256(keccak256(abi.encodePacked("nullifier", noteId, finalBalance))),
+            isGenesis: isGenesis,
+            hasClearance: hasClearance,
+            stateSigEpoch: isGenesis ? 0 : uint32(1),
+            stateSigRoot: isGenesis ? 0 : uint256(0xABCD),
+            clearSigEpoch: hasClearance ? uint32(1) : uint32(0),
+            clearSigRoot: hasClearance ? uint256(0x1234) : uint256(0)
+        });
     }
 
-    function _buildRequestInputs(
-        uint256 requestNullifier
-    ) internal view returns (Types.RequestPublicInputs memory) {
-        return
-            Types.RequestPublicInputs({
-                statementType: 1,
-                protocolVersion: 1,
-                chainId: uint64(block.chainid),
-                contractAddress: address(vault),
-                activeRoot: vault.currentRoot(),
-                stateSigEpoch: 0,
-                stateSigRoot: 0,
-                requestNullifier: requestNullifier,
-                anonCommitmentX: 0,
-                anonCommitmentY: 0,
-                expiryTs: uint64(block.timestamp) + 3600,
-                solvencyBound: 1 ether
-            });
+    function _buildRequestInputs(uint256 requestNullifier) internal view returns (Types.RequestPublicInputs memory) {
+        return Types.RequestPublicInputs({
+            statementType: 1,
+            protocolVersion: 1,
+            chainId: uint64(block.chainid),
+            contractAddress: address(vault),
+            activeRoot: vault.currentRoot(),
+            stateSigEpoch: 0,
+            stateSigRoot: 0,
+            requestNullifier: requestNullifier,
+            anonCommitmentX: 0,
+            anonCommitmentY: 0,
+            expiryTs: uint64(block.timestamp) + 3600,
+            solvencyBound: 1 ether
+        });
     }
 
     /// @dev Helper: deposit a note and return the siblings used (for later removal).
-    function _depositNote(
-        bytes32 commitment,
-        uint128 amount
-    ) internal returns (uint32 noteId, uint256[32] memory siblings, uint64 expiryTs) {
+    function _depositNote(bytes32 commitment, uint128 amount)
+        internal
+        returns (uint32 noteId, uint256[32] memory siblings, uint64 expiryTs)
+    {
         noteId = vault.nextNoteId();
         siblings = _siblingsForEmptySlot(noteId);
         vm.prank(user);
@@ -260,12 +259,7 @@ contract ZkApiVaultTest is Test, Events {
         vault.deposit(commitment, amount, siblings);
 
         // Note should be active
-        (
-            bytes32 noteCommitment,
-            uint128 depositAmount,
-            uint64 expiryTs,
-            Types.NoteStatus status
-        ) = vault.notes(0);
+        (bytes32 noteCommitment, uint128 depositAmount, uint64 expiryTs, Types.NoteStatus status) = vault.notes(0);
         assertEq(noteCommitment, commitment);
         assertEq(depositAmount, amount);
         assertEq(expiryTs, uint64(block.timestamp) + NOTE_TTL);
@@ -314,14 +308,12 @@ contract ZkApiVaultTest is Test, Events {
         // Deposit
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         uint256 rootBeforeClose = vault.currentRoot();
 
         // Build withdrawal inputs with clearance
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 7 ether, destination, true, false
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 7 ether, destination, true, false);
         // Fix the root to match current
         inputs.activeRoot = rootBeforeClose;
 
@@ -329,7 +321,7 @@ contract ZkApiVaultTest is Test, Events {
         vault.mutualClose(inputs, "", siblings);
 
         // Note should be Closed
-        (, , , Types.NoteStatus status) = vault.notes(noteId);
+        (,,, Types.NoteStatus status) = vault.notes(noteId);
         assertEq(uint8(status), uint8(Types.NoteStatus.Closed));
 
         // Root should return to empty root (only note was removed)
@@ -348,11 +340,9 @@ contract ZkApiVaultTest is Test, Events {
 
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 5 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, true, false
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, true, false);
         inputs.activeRoot = vault.currentRoot();
 
         vault.mutualClose(inputs, "", siblings);
@@ -367,11 +357,9 @@ contract ZkApiVaultTest is Test, Events {
 
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 5 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 0, destination, true, false
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 0, destination, true, false);
         inputs.activeRoot = vault.currentRoot();
 
         vault.mutualClose(inputs, "", siblings);
@@ -387,33 +375,26 @@ contract ZkApiVaultTest is Test, Events {
     function test_escapeHatch_freezesNote() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         uint256 rootBeforeEscape = vault.currentRoot();
 
         // Build escape withdrawal inputs (no clearance, genesis)
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 6 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 6 ether, destination, false, true);
         inputs.activeRoot = rootBeforeEscape;
 
         vault.initiateEscapeWithdrawal(inputs, "", siblings);
 
         // Note should be PendingWithdrawal
-        (, , , Types.NoteStatus status) = vault.notes(noteId);
+        (,,, Types.NoteStatus status) = vault.notes(noteId);
         assertEq(uint8(status), uint8(Types.NoteStatus.PendingWithdrawal));
 
         // Leaf should be zeroed (root returns to empty root since it's the only note)
         assertEq(vault.currentRoot(), emptyRoot, "leaf should be zeroed");
 
         // Pending withdrawal data should exist
-        (
-            bool exists,
-            uint256 nullifier,
-            uint128 finalBalance,
-            address dest,
-            uint64 challengeDeadline
-        ) = vault.pendingWithdrawals(noteId);
+        (bool exists, uint256 nullifier, uint128 finalBalance, address dest, uint64 challengeDeadline) =
+            vault.pendingWithdrawals(noteId);
         assertTrue(exists);
         assertEq(nullifier, inputs.withdrawalNullifier);
         assertEq(finalBalance, 6 ether);
@@ -434,14 +415,12 @@ contract ZkApiVaultTest is Test, Events {
     function test_challenge_restoresLeaf() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         uint256 rootAfterDeposit = vault.currentRoot();
 
         // Initiate escape withdrawal
-        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(
-            noteId, 6 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(noteId, 6 ether, destination, false, true);
         wInputs.activeRoot = rootAfterDeposit;
 
         vault.initiateEscapeWithdrawal(wInputs, "", siblings);
@@ -459,18 +438,18 @@ contract ZkApiVaultTest is Test, Events {
         vault.challengeEscapeWithdrawal(noteId, rInputs, "", restoreSiblings);
 
         // Note should be restored to Active
-        (, , , Types.NoteStatus status) = vault.notes(noteId);
+        (,,, Types.NoteStatus status) = vault.notes(noteId);
         assertEq(uint8(status), uint8(Types.NoteStatus.Active));
 
         // Root should be restored to what it was after deposit
         assertEq(vault.currentRoot(), rootAfterDeposit, "root should be restored");
 
         // Pending withdrawal should be cleared
-        (bool exists, , , , ) = vault.pendingWithdrawals(noteId);
+        (bool exists,,,,) = vault.pendingWithdrawals(noteId);
         assertFalse(exists);
 
-        // Nullifier should be un-consumed
-        assertFalse(vault.usedNullifiers(wInputs.withdrawalNullifier));
+        // The stale-withdrawal nullifier stays burned once challenged.
+        assertTrue(vault.usedNullifiers(wInputs.withdrawalNullifier));
     }
 
     // -----------------------------------------------------------------------
@@ -480,12 +459,10 @@ contract ZkApiVaultTest is Test, Events {
     function test_finalize_afterDeadline_settlesCorrectly() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         // Initiate escape
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 4 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 4 ether, destination, false, true);
         inputs.activeRoot = vault.currentRoot();
 
         vault.initiateEscapeWithdrawal(inputs, "", siblings);
@@ -497,7 +474,7 @@ contract ZkApiVaultTest is Test, Events {
         vault.finalizeEscapeWithdrawal(noteId);
 
         // Note should be Closed
-        (, , , Types.NoteStatus status) = vault.notes(noteId);
+        (,,, Types.NoteStatus status) = vault.notes(noteId);
         assertEq(uint8(status), uint8(Types.NoteStatus.Closed));
 
         // Settlement: user gets 4 ether, treasury gets 6 ether
@@ -505,7 +482,7 @@ contract ZkApiVaultTest is Test, Events {
         assertEq(token.balanceOf(treasury), 6 ether, "treasury gets operator share");
 
         // Pending withdrawal data should be cleared
-        (bool exists, , , , ) = vault.pendingWithdrawals(noteId);
+        (bool exists,,,,) = vault.pendingWithdrawals(noteId);
         assertFalse(exists);
     }
 
@@ -524,7 +501,7 @@ contract ZkApiVaultTest is Test, Events {
         vault.claimExpired(noteId, siblings);
 
         // Note should be Closed
-        (, , , Types.NoteStatus status) = vault.notes(noteId);
+        (,,, Types.NoteStatus status) = vault.notes(noteId);
         assertEq(uint8(status), uint8(Types.NoteStatus.Closed));
 
         // Full deposit goes to treasury
@@ -556,15 +533,13 @@ contract ZkApiVaultTest is Test, Events {
 
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         // Disable acceptAll on the mock adapter
         vm.prank(owner);
         adapter.setAcceptAll(false);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, true, false
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, true, false);
         inputs.activeRoot = vault.currentRoot();
 
         // Should revert with InvalidProof because envelope doesn't match
@@ -575,14 +550,12 @@ contract ZkApiVaultTest is Test, Events {
     function test_invalidProof_initiateEscape() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         vm.prank(owner);
         adapter.setAcceptAll(false);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, false, true);
         inputs.activeRoot = vault.currentRoot();
 
         vm.expectRevert(Errors.InvalidProof.selector);
@@ -592,12 +565,10 @@ contract ZkApiVaultTest is Test, Events {
     function test_invalidProof_challengeEscape() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         // Initiate escape (adapter still accepts all)
-        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(noteId, 5 ether, destination, false, true);
         wInputs.activeRoot = vault.currentRoot();
         vault.initiateEscapeWithdrawal(wInputs, "", siblings);
 
@@ -621,11 +592,9 @@ contract ZkApiVaultTest is Test, Events {
     function test_doubleFinalize_reverts() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 4 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 4 ether, destination, false, true);
         inputs.activeRoot = vault.currentRoot();
 
         vault.initiateEscapeWithdrawal(inputs, "", siblings);
@@ -646,17 +615,15 @@ contract ZkApiVaultTest is Test, Events {
     function test_challengeAfterDeadline_reverts() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         // Initiate escape
-        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(noteId, 5 ether, destination, false, true);
         wInputs.activeRoot = vault.currentRoot();
         vault.initiateEscapeWithdrawal(wInputs, "", siblings);
 
         // Warp to exactly the deadline (>= means expired)
-        (, , , , uint64 challengeDeadline) = vault.pendingWithdrawals(noteId);
+        (,,,, uint64 challengeDeadline) = vault.pendingWithdrawals(noteId);
         vm.warp(challengeDeadline);
 
         Types.RequestPublicInputs memory rInputs = _buildRequestInputs(wInputs.withdrawalNullifier);
@@ -670,11 +637,9 @@ contract ZkApiVaultTest is Test, Events {
     function test_challengeAfterDeadline_pastDeadline_reverts() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(noteId, 5 ether, destination, false, true);
         wInputs.activeRoot = vault.currentRoot();
         vault.initiateEscapeWithdrawal(wInputs, "", siblings);
 
@@ -698,11 +663,9 @@ contract ZkApiVaultTest is Test, Events {
 
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, true, false
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, true, false);
         // Set a stale/wrong root
         inputs.activeRoot = emptyRoot;
 
@@ -713,11 +676,9 @@ contract ZkApiVaultTest is Test, Events {
     function test_rootMismatch_initiateEscape() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, false, true);
         // Set wrong root
         inputs.activeRoot = 12345;
 
@@ -834,12 +795,10 @@ contract ZkApiVaultTest is Test, Events {
 
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         // Build inputs without clearance but call mutualClose
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, false, true);
         inputs.activeRoot = vault.currentRoot();
 
         vm.expectRevert(Errors.InvalidStatementType.selector);
@@ -851,12 +810,10 @@ contract ZkApiVaultTest is Test, Events {
 
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         // Build inputs with clearance but call initiateEscapeWithdrawal
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, true, false
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, true, false);
         inputs.activeRoot = vault.currentRoot();
 
         vm.expectRevert(Errors.InvalidStatementType.selector);
@@ -868,11 +825,9 @@ contract ZkApiVaultTest is Test, Events {
 
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, true, false
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, true, false);
         inputs.activeRoot = vault.currentRoot();
         inputs.statementType = 1; // wrong type
 
@@ -885,11 +840,9 @@ contract ZkApiVaultTest is Test, Events {
 
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, true, false
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, true, false);
         inputs.activeRoot = vault.currentRoot();
 
         // First close should succeed
@@ -905,10 +858,14 @@ contract ZkApiVaultTest is Test, Events {
 
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 11 ether, destination, true, false // finalBalance > depositAmount
+            noteId,
+            11 ether,
+            destination,
+            true,
+            false // finalBalance > depositAmount
         );
         inputs.activeRoot = vault.currentRoot();
 
@@ -921,11 +878,9 @@ contract ZkApiVaultTest is Test, Events {
 
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, true, false
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, true, false);
         inputs.activeRoot = vault.currentRoot();
 
         // State sig epoch 1 not registered
@@ -936,11 +891,9 @@ contract ZkApiVaultTest is Test, Events {
     function test_finalize_beforeDeadline_reverts() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 4 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 4 ether, destination, false, true);
         inputs.activeRoot = vault.currentRoot();
 
         vault.initiateEscapeWithdrawal(inputs, "", siblings);
@@ -965,12 +918,10 @@ contract ZkApiVaultTest is Test, Events {
 
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         // Close the note first via mutual close
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, amount, destination, true, false
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, amount, destination, true, false);
         inputs.activeRoot = vault.currentRoot();
         vault.mutualClose(inputs, "", siblings);
 
@@ -1000,14 +951,12 @@ contract ZkApiVaultTest is Test, Events {
 
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         vm.prank(owner);
         vault.pause();
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, true, false
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, true, false);
         inputs.activeRoot = vault.currentRoot();
 
         vm.expectRevert(Errors.Paused.selector);
@@ -1067,12 +1016,10 @@ contract ZkApiVaultTest is Test, Events {
     function test_challenge_wrongStatementType_reverts() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         // Initiate escape
-        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(noteId, 5 ether, destination, false, true);
         wInputs.activeRoot = vault.currentRoot();
         vault.initiateEscapeWithdrawal(wInputs, "", siblings);
 
@@ -1094,12 +1041,10 @@ contract ZkApiVaultTest is Test, Events {
     function test_challenge_wrongNullifier_reverts() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         // Initiate escape
-        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(noteId, 5 ether, destination, false, true);
         wInputs.activeRoot = vault.currentRoot();
         vault.initiateEscapeWithdrawal(wInputs, "", siblings);
 
@@ -1137,17 +1082,21 @@ contract ZkApiVaultTest is Test, Events {
     function test_escape_genesis_noEpochNeeded() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, amount, destination, false, true // isGenesis = true
+            noteId,
+            amount,
+            destination,
+            false,
+            true // isGenesis = true
         );
         inputs.activeRoot = vault.currentRoot();
 
         // Should succeed without any epoch registered
         vault.initiateEscapeWithdrawal(inputs, "", siblings);
 
-        (, , , Types.NoteStatus status) = vault.notes(noteId);
+        (,,, Types.NoteStatus status) = vault.notes(noteId);
         assertEq(uint8(status), uint8(Types.NoteStatus.PendingWithdrawal));
     }
 
@@ -1158,10 +1107,14 @@ contract ZkApiVaultTest is Test, Events {
     function test_escape_nonGenesis_needsEpoch() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, amount, destination, false, false // isGenesis = false, no clearance
+            noteId,
+            amount,
+            destination,
+            false,
+            false // isGenesis = false, no clearance
         );
         inputs.activeRoot = vault.currentRoot();
         // stateSigEpoch = 1, but no epoch registered
@@ -1214,14 +1167,12 @@ contract ZkApiVaultTest is Test, Events {
 
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         uint256 rootAfterDeposit = vault.currentRoot();
 
         // Step 1: Initiate escape withdrawal
-        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(
-            noteId, 3 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(noteId, 3 ether, destination, false, true);
         wInputs.activeRoot = rootAfterDeposit;
         vault.initiateEscapeWithdrawal(wInputs, "", siblings);
 
@@ -1235,16 +1186,14 @@ contract ZkApiVaultTest is Test, Events {
         assertEq(vault.currentRoot(), rootAfterDeposit);
 
         // Step 3: Now do a mutual close
-        Types.WithdrawalPublicInputs memory mcInputs = _buildWithdrawalInputs(
-            noteId, 7 ether, destination, true, false
-        );
+        Types.WithdrawalPublicInputs memory mcInputs = _buildWithdrawalInputs(noteId, 7 ether, destination, true, false);
         mcInputs.activeRoot = vault.currentRoot();
         // Need a different nullifier since the old one was un-consumed
         mcInputs.withdrawalNullifier = uint256(keccak256(abi.encodePacked("nullifier2", noteId)));
 
         vault.mutualClose(mcInputs, "", siblings);
 
-        (, , , Types.NoteStatus status) = vault.notes(noteId);
+        (,,, Types.NoteStatus status) = vault.notes(noteId);
         assertEq(uint8(status), uint8(Types.NoteStatus.Closed));
 
         assertEq(token.balanceOf(destination), 7 ether);
@@ -1258,12 +1207,10 @@ contract ZkApiVaultTest is Test, Events {
     function test_fullLifecycle_escapeAndFinalize() public {
         bytes32 commitment = bytes32(uint256(99));
         uint128 amount = 20 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         // Initiate escape withdrawal
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 12 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 12 ether, destination, false, true);
         inputs.activeRoot = vault.currentRoot();
         vault.initiateEscapeWithdrawal(inputs, "", siblings);
 
@@ -1285,22 +1232,20 @@ contract ZkApiVaultTest is Test, Events {
     function test_finalize_atExactDeadline_succeeds() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, false, true);
         inputs.activeRoot = vault.currentRoot();
         vault.initiateEscapeWithdrawal(inputs, "", siblings);
 
-        (, , , , uint64 challengeDeadline) = vault.pendingWithdrawals(noteId);
+        (,,,, uint64 challengeDeadline) = vault.pendingWithdrawals(noteId);
 
         // Warp to exactly the deadline - finalize uses `<` so at deadline it should succeed
         vm.warp(challengeDeadline);
 
         vault.finalizeEscapeWithdrawal(noteId);
 
-        (, , , Types.NoteStatus status) = vault.notes(noteId);
+        (,,, Types.NoteStatus status) = vault.notes(noteId);
         assertEq(uint8(status), uint8(Types.NoteStatus.Closed));
     }
 
@@ -1311,17 +1256,15 @@ contract ZkApiVaultTest is Test, Events {
     function test_challenge_justBeforeDeadline_succeeds() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         uint256 rootAfterDeposit = vault.currentRoot();
 
-        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(noteId, 5 ether, destination, false, true);
         wInputs.activeRoot = rootAfterDeposit;
         vault.initiateEscapeWithdrawal(wInputs, "", siblings);
 
-        (, , , , uint64 challengeDeadline) = vault.pendingWithdrawals(noteId);
+        (,,,, uint64 challengeDeadline) = vault.pendingWithdrawals(noteId);
 
         // Warp to 1 second before deadline
         vm.warp(challengeDeadline - 1);
@@ -1332,7 +1275,7 @@ contract ZkApiVaultTest is Test, Events {
 
         vault.challengeEscapeWithdrawal(noteId, rInputs, "", restoreSiblings);
 
-        (, , , Types.NoteStatus status) = vault.notes(noteId);
+        (,,, Types.NoteStatus status) = vault.notes(noteId);
         assertEq(uint8(status), uint8(Types.NoteStatus.Active));
         assertEq(vault.currentRoot(), rootAfterDeposit);
     }
@@ -1344,11 +1287,9 @@ contract ZkApiVaultTest is Test, Events {
     function test_escape_invalidBalance_reverts() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 11 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 11 ether, destination, false, true);
         inputs.activeRoot = vault.currentRoot();
 
         vm.expectRevert(Errors.InvalidBalance.selector);
@@ -1365,12 +1306,10 @@ contract ZkApiVaultTest is Test, Events {
         uint128 amount = 10 ether;
 
         // Deposit note 0
-        (uint32 noteId0, uint256[32] memory siblings0, ) = _depositNote(commitment1, amount);
+        (uint32 noteId0, uint256[32] memory siblings0,) = _depositNote(commitment1, amount);
 
         // Initiate escape on note 0
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId0, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId0, 5 ether, destination, false, true);
         inputs.activeRoot = vault.currentRoot();
         vault.initiateEscapeWithdrawal(inputs, "", siblings0);
 
@@ -1392,9 +1331,7 @@ contract ZkApiVaultTest is Test, Events {
         vault.deposit(commitment2, amount, siblings1);
 
         // Try to use the same nullifier for note 1
-        Types.WithdrawalPublicInputs memory inputs2 = _buildWithdrawalInputs(
-            1, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs2 = _buildWithdrawalInputs(1, 5 ether, destination, false, true);
         inputs2.activeRoot = vault.currentRoot();
         inputs2.withdrawalNullifier = inputs.withdrawalNullifier; // reuse nullifier
 
@@ -1409,14 +1346,12 @@ contract ZkApiVaultTest is Test, Events {
     function test_pause_blocksEscapeInit() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
         vm.prank(owner);
         vault.pause();
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, false, true);
         inputs.activeRoot = vault.currentRoot();
 
         vm.expectRevert(Errors.Paused.selector);
@@ -1426,11 +1361,9 @@ contract ZkApiVaultTest is Test, Events {
     function test_pause_blocksFinalize() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory inputs = _buildWithdrawalInputs(noteId, 5 ether, destination, false, true);
         inputs.activeRoot = vault.currentRoot();
         vault.initiateEscapeWithdrawal(inputs, "", siblings);
 
@@ -1460,11 +1393,9 @@ contract ZkApiVaultTest is Test, Events {
     function test_pause_blocksChallenge() public {
         bytes32 commitment = bytes32(uint256(42));
         uint128 amount = 10 ether;
-        (uint32 noteId, uint256[32] memory siblings, ) = _depositNote(commitment, amount);
+        (uint32 noteId, uint256[32] memory siblings,) = _depositNote(commitment, amount);
 
-        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(
-            noteId, 5 ether, destination, false, true
-        );
+        Types.WithdrawalPublicInputs memory wInputs = _buildWithdrawalInputs(noteId, 5 ether, destination, false, true);
         wInputs.activeRoot = vault.currentRoot();
         vault.initiateEscapeWithdrawal(wInputs, "", siblings);
 

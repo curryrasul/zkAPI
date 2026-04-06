@@ -79,6 +79,21 @@ enum Commands {
         /// Database path.
         #[arg(long, default_value = "zkapi-server.db")]
         db_path: String,
+        /// State-signing XMSS seed as a felt hex string.
+        #[arg(long, default_value = "0x1")]
+        state_seed: String,
+        /// Clearance-signing XMSS seed as a felt hex string.
+        #[arg(long, default_value = "0x2")]
+        clear_seed: String,
+        /// Published XMSS epoch.
+        #[arg(long, default_value_t = 1)]
+        epoch: u32,
+        /// XMSS tree height.
+        #[arg(long, default_value_t = zkapi_types::XMSS_TREE_HEIGHT)]
+        xmss_height: usize,
+        /// Initial accepted active root before the indexer updates the server.
+        #[arg(long, default_value = "0x0")]
+        initial_root: String,
     },
 
     /// Start the indexer.
@@ -159,11 +174,30 @@ async fn main() -> anyhow::Result<()> {
             println!("No active note found. Run `zkapi deposit` to get started.");
         }
 
-        Commands::Server { listen, db_path } => {
+        Commands::Server {
+            listen,
+            db_path,
+            state_seed,
+            clear_seed,
+            epoch,
+            xmss_height,
+            initial_root,
+        } => {
             println!("Starting zkAPI server on {} with DB at {}", listen, db_path);
+            let state_seed = Felt252::from_hex(&state_seed)
+                .map_err(|e| anyhow::anyhow!("invalid --state-seed: {}", e))?;
+            let clear_seed = Felt252::from_hex(&clear_seed)
+                .map_err(|e| anyhow::anyhow!("invalid --clear-seed: {}", e))?;
+            let initial_root = Felt252::from_hex(&initial_root)
+                .map_err(|e| anyhow::anyhow!("invalid --initial-root: {}", e))?;
             let config = zkapi_server::config::ServerConfig {
                 listen_addr: listen,
                 db_path,
+                state_seed,
+                clear_seed,
+                epoch,
+                xmss_height,
+                initial_root,
                 ..Default::default()
             };
             zkapi_server::routes::run_server(config).await?;

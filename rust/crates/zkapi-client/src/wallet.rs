@@ -10,22 +10,23 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use rand::Rng;
 use zkapi_core::poseidon::FieldElement;
 
-use zkapi_core::commitment::compute_state_message;
+use zkapi_core::commitment::{compute_clearance_message, compute_state_message};
 use zkapi_core::leaf::compute_registration_commitment;
 use zkapi_core::nullifier::compute_nullifier;
 use zkapi_core::poseidon::{felt_to_field, field_to_felt};
-use zkapi_crypto::pedersen::PedersenCommitment;
-use zkapi_proof::mock::MOCK_PROOF_ENVELOPE;
+use zkapi_crypto::{pedersen::PedersenCommitment, xmss::XmssVerifier};
+use zkapi_proof::{RequestProofBuilder, WithdrawalProofBuilder};
 use zkapi_types::wire::{
     ApiRequest, ClearanceRequest, ClearanceResponse, ErrorResponse, RecoveryResponse,
     RequestResponse,
 };
 use zkapi_types::{
-    Felt252, RequestPublicInputs, WithdrawalPublicInputs, STATEMENT_TYPE_REQUEST,
-    STATEMENT_TYPE_WITHDRAWAL,
+    Felt252, RequestPublicInputs, WithdrawalPublicInputs, MERKLE_DEPTH,
+    STATEMENT_TYPE_REQUEST, STATEMENT_TYPE_WITHDRAWAL,
 };
 
 use crate::config::ClientConfig;
@@ -166,7 +167,7 @@ impl Wallet {
         payload: &str,
         payload_hash: Felt252,
         active_root: Felt252,
-        _merkle_siblings: Vec<Felt252>,
+        merkle_siblings: Vec<Felt252>,
     ) -> Result<RequestResponse, ClientError> {
         // 1. Check no pending journal exists.
         if PendingRequestJournal::read(&self.journal_path)?.is_some() {
@@ -192,6 +193,7 @@ impl Wallet {
         // 2. Build request proof inputs.
         let current_blinding = parse_blinding(&state.balance_blinding)?;
         let user_rerandomization = sample_field_element(&mut rng);
+        let siblings = siblings_from_vec(merkle_siblings)?;
 
         // Compute anon_commitment = E(current_balance, current_blinding + user_rerand).
         let anon_blinding = current_blinding + user_rerandomization;
@@ -204,8 +206,14 @@ impl Wallet {
         let (state_sig_epoch, state_sig_root) = if state.is_genesis {
             (0u32, Felt252::ZERO)
         } else {
-            // In production the sig root would be fetched from the indexer.
-            (state.state_sig_epoch.unwrap_or(0), Felt252::ZERO)
+            (
+                state.state_sig_epoch.ok_or_else(|| {
+                    ClientError::ProofGeneration("missing state_sig_epoch".into())
+                })?,
+                state.state_sig_root.ok_or_else(|| {
+                    ClientError::ProofGeneration("missing state_sig_root".into())
+                })?,
+            )
         };
 
         let public_inputs = RequestPublicInputs {
@@ -223,9 +231,29 @@ impl Wallet {
             solvency_bound: solvency,
         };
 
-        // 3. Generate proof (mock in v1).
-        let proof_bytes = MOCK_PROOF_ENVELOPE.to_vec();
-        let proof_b64 = base64_encode(&proof_bytes);
+        let proof_builder = RequestProofBuilder::new(
+            state.secret_s,
+            state.note_id,
+            state.deposit_amount,
+            state.expiry_ts,
+            siblings,
+            state.current_balance,
+            current_blinding,
+            user_rerandomization,
+            state.current_anchor,
+            state.is_genesis,
+            state_sig_epoch,
+            state_sig_root,
+            active_root,
+            state.protocol_version,
+            state.chain_id,
+            state.contract_address,
+            solvency,
+        );
+        let proof_bytes = proof_builder
+            .generate_proof(state.state_sig.as_ref())
+            .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
+        let proof_b64 = base64::engine::general_purpose::STANDARD.encode(&proof_bytes);
 
         // 4. Write journal.
         let client_request_id = uuid::Uuid::new_v4().to_string();
@@ -234,6 +262,7 @@ impl Wallet {
             client_request_id: client_request_id.clone(),
             nullifier: request_nullifier,
             payload_hash,
+            user_rerandomization: field_to_felt(&user_rerandomization),
             created_at_ms: now_ms(),
         };
         PendingRequestJournal::write(&self.journal_path, &journal)?;
@@ -314,6 +343,7 @@ impl Wallet {
         next_state.current_anchor = server_resp.next_anchor;
         next_state.is_genesis = false;
         next_state.state_sig_epoch = Some(server_resp.next_state_sig_epoch);
+        next_state.state_sig_root = Some(server_resp.next_state_sig_root);
         next_state.state_sig = Some(server_resp.next_state_sig.clone());
 
         // 8. Save new state atomically.
@@ -384,11 +414,22 @@ impl Wallet {
                 e
             )));
         }
+        if resp.next_state_sig_epoch == 0 || resp.next_state_sig_root.is_zero() {
+            return Err(ClientError::InvalidResponse(
+                "missing non-genesis state signature root/epoch".into(),
+            ));
+        }
+        if resp.next_state_sig.epoch != resp.next_state_sig_epoch {
+            return Err(ClientError::VerificationFailed(format!(
+                "state sig epoch mismatch: {} != {}",
+                resp.next_state_sig.epoch, resp.next_state_sig_epoch
+            )));
+        }
 
         // Compute the state message that should have been signed.
         // In production the client would fetch the XMSS root for the returned
         // epoch from the indexer / on-chain and verify the full XMSS signature.
-        let _state_msg = compute_state_message(
+        let state_msg = compute_state_message(
             state.protocol_version,
             state.chain_id,
             &state.contract_address,
@@ -397,8 +438,11 @@ impl Wallet {
             &resp.next_anchor,
         );
 
-        // Full XMSS verification is deferred until the epoch root is known:
-        // XmssVerifier::verify(&epoch_root, &state_msg, &resp.next_state_sig)
+        if !XmssVerifier::verify(&resp.next_state_sig_root, &state_msg, &resp.next_state_sig) {
+            return Err(ClientError::VerificationFailed(
+                "state signature XMSS verification failed".into(),
+            ));
+        }
 
         Ok(())
     }
@@ -417,9 +461,10 @@ impl Wallet {
         &mut self,
         destination: [u8; 20],
         active_root: Felt252,
-        _merkle_siblings: Vec<Felt252>,
+        merkle_siblings: Vec<Felt252>,
     ) -> Result<(WithdrawalPublicInputs, Vec<u8>), ClientError> {
         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
+        let siblings = siblings_from_vec(merkle_siblings)?;
 
         // 1. Compute withdrawal_nullifier.
         let withdrawal_nullifier = compute_nullifier(&state.secret_s, &state.current_anchor);
@@ -431,7 +476,14 @@ impl Wallet {
         let (state_sig_epoch, state_sig_root) = if state.is_genesis {
             (0u32, Felt252::ZERO)
         } else {
-            (state.state_sig_epoch.unwrap_or(0), Felt252::ZERO)
+            (
+                state.state_sig_epoch.ok_or_else(|| {
+                    ClientError::ProofGeneration("missing state_sig_epoch".into())
+                })?,
+                state.state_sig_root.ok_or_else(|| {
+                    ClientError::ProofGeneration("missing state_sig_root".into())
+                })?,
+            )
         };
 
         let public_inputs = WithdrawalPublicInputs {
@@ -449,11 +501,34 @@ impl Wallet {
             state_sig_epoch,
             state_sig_root,
             clear_sig_epoch: clearance.clear_sig_epoch,
-            clear_sig_root: Felt252::ZERO, // fetched from chain in production
+            clear_sig_root: clearance.clear_sig_root,
         };
 
-        // 4. Generate proof (mock in v1).
-        let proof_bytes = MOCK_PROOF_ENVELOPE.to_vec();
+        let current_blinding = parse_blinding(&state.balance_blinding)?;
+        let proof_builder = WithdrawalProofBuilder::new(
+            state.secret_s,
+            state.note_id,
+            state.deposit_amount,
+            state.expiry_ts,
+            siblings,
+            state.current_balance,
+            current_blinding,
+            state.current_anchor,
+            state.is_genesis,
+            state_sig_epoch,
+            state_sig_root,
+            true,
+            clearance.clear_sig_epoch,
+            clearance.clear_sig_root,
+            destination,
+            active_root,
+            state.protocol_version,
+            state.chain_id,
+            state.contract_address,
+        );
+        let proof_bytes = proof_builder
+            .generate_proof(state.state_sig.as_ref(), Some(&clearance.clear_sig))
+            .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
 
         Ok((public_inputs, proof_bytes))
     }
@@ -470,9 +545,10 @@ impl Wallet {
         &self,
         destination: [u8; 20],
         active_root: Felt252,
-        _merkle_siblings: Vec<Felt252>,
+        merkle_siblings: Vec<Felt252>,
     ) -> Result<(WithdrawalPublicInputs, Vec<u8>), ClientError> {
         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
+        let siblings = siblings_from_vec(merkle_siblings)?;
 
         // 1. Compute withdrawal_nullifier.
         let withdrawal_nullifier = compute_nullifier(&state.secret_s, &state.current_anchor);
@@ -480,7 +556,14 @@ impl Wallet {
         let (state_sig_epoch, state_sig_root) = if state.is_genesis {
             (0u32, Felt252::ZERO)
         } else {
-            (state.state_sig_epoch.unwrap_or(0), Felt252::ZERO)
+            (
+                state.state_sig_epoch.ok_or_else(|| {
+                    ClientError::ProofGeneration("missing state_sig_epoch".into())
+                })?,
+                state.state_sig_root.ok_or_else(|| {
+                    ClientError::ProofGeneration("missing state_sig_root".into())
+                })?,
+            )
         };
 
         // 2. Build withdrawal proof with has_clearance = false.
@@ -502,8 +585,31 @@ impl Wallet {
             clear_sig_root: Felt252::ZERO,
         };
 
-        // 3. Generate proof (mock in v1).
-        let proof_bytes = MOCK_PROOF_ENVELOPE.to_vec();
+        let current_blinding = parse_blinding(&state.balance_blinding)?;
+        let proof_builder = WithdrawalProofBuilder::new(
+            state.secret_s,
+            state.note_id,
+            state.deposit_amount,
+            state.expiry_ts,
+            siblings,
+            state.current_balance,
+            current_blinding,
+            state.current_anchor,
+            state.is_genesis,
+            state_sig_epoch,
+            state_sig_root,
+            false,
+            0,
+            Felt252::ZERO,
+            destination,
+            active_root,
+            state.protocol_version,
+            state.chain_id,
+            state.contract_address,
+        );
+        let proof_bytes = proof_builder
+            .generate_proof(state.state_sig.as_ref(), None)
+            .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
 
         Ok((public_inputs, proof_bytes))
     }
@@ -563,26 +669,26 @@ impl Wallet {
                 })?;
 
                 let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
+                let user_rerandomization = felt_to_field(&journal.user_rerandomization);
+                let current_blinding = parse_blinding(&state.balance_blinding)?;
+                let anon_blinding = current_blinding + user_rerandomization;
+                let anon_commitment =
+                    PedersenCommitment::commit(state.current_balance, &anon_blinding);
+
+                self.verify_request_response(
+                    &server_resp,
+                    &anon_commitment,
+                    &user_rerandomization,
+                    &current_blinding,
+                )?;
 
                 let charge = server_resp.charge_applied;
                 let next_balance = state.current_balance.checked_sub(charge).ok_or_else(|| {
                     ClientError::InvalidResponse("charge exceeds balance".into())
                 })?;
 
-                // Recompute next blinding. During recovery we lack the
-                // user_rerandomization that was used in the original request.
-                //
-                // In a production implementation the user_rerandomization would
-                // be stored in the journal or derived deterministically from a
-                // seed. For v1 we apply only the server's blind_delta to the
-                // current blinding and accept the server-returned commitment
-                // after verifying the state signature.
-                //
-                // TODO: persist user_rerandomization in the journal for full
-                // algebraic recovery.
-                let current_blinding = parse_blinding(&state.balance_blinding)?;
                 let blind_delta_srv = felt_to_field(&server_resp.blind_delta_srv);
-                let next_blinding = current_blinding + blind_delta_srv;
+                let next_blinding = current_blinding + user_rerandomization + blind_delta_srv;
                 let next_blinding_hex =
                     format!("0x{}", hex::encode(next_blinding.to_bytes_be()));
 
@@ -594,6 +700,7 @@ impl Wallet {
                 next_state.current_anchor = server_resp.next_anchor;
                 next_state.is_genesis = false;
                 next_state.state_sig_epoch = Some(server_resp.next_state_sig_epoch);
+                next_state.state_sig_root = Some(server_resp.next_state_sig_root);
                 next_state.state_sig = Some(server_resp.next_state_sig.clone());
 
                 next_state.save(&self.state_path)?;
@@ -655,7 +762,32 @@ impl Wallet {
             )));
         }
 
-        serde_json::from_str(&body).map_err(|e| ClientError::InvalidResponse(e.to_string()))
+        let clearance: ClearanceResponse =
+            serde_json::from_str(&body).map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+        if clearance.clear_sig_root.is_zero() {
+            return Err(ClientError::InvalidResponse(
+                "clearance response missing clear_sig_root".into(),
+            ));
+        }
+        if clearance.clear_sig.epoch != clearance.clear_sig_epoch {
+            return Err(ClientError::VerificationFailed(format!(
+                "clearance signature epoch mismatch: {} != {}",
+                clearance.clear_sig.epoch, clearance.clear_sig_epoch
+            )));
+        }
+        let clear_msg = compute_clearance_message(
+            self.config.protocol_version,
+            self.config.chain_id,
+            &self.config.contract_address,
+            withdrawal_nullifier,
+        );
+        if !XmssVerifier::verify(&clearance.clear_sig_root, &clear_msg, &clearance.clear_sig) {
+            return Err(ClientError::VerificationFailed(
+                "clearance XMSS verification failed".into(),
+            ));
+        }
+
+        Ok(clearance)
     }
 }
 
@@ -705,30 +837,18 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Inline base64 encoder (avoids pulling in a dedicated crate).
-fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(CHARS[(triple & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
+/// Convert a sibling vector from the indexer into the fixed-size array used
+/// throughout the proof code.
+fn siblings_from_vec(
+    siblings: Vec<Felt252>,
+) -> Result<[Felt252; MERKLE_DEPTH], ClientError> {
+    siblings.try_into().map_err(|v: Vec<Felt252>| {
+        ClientError::ProofGeneration(format!(
+            "expected {} merkle siblings, got {}",
+            MERKLE_DEPTH,
+            v.len()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -800,8 +920,18 @@ mod tests {
         wallet.confirm_deposit(secret, 0, 1000, 1700000000).unwrap();
 
         let dest = [0xdeu8, 0xad, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-        let root = Felt252::from_u64(123);
-        let siblings = vec![Felt252::ZERO; 32];
+        let state = wallet.state().unwrap().clone();
+        let commitment = compute_registration_commitment(&state.secret_s);
+        let leaf = zkapi_core::leaf::compute_note_leaf(
+            state.note_id,
+            &commitment,
+            state.deposit_amount,
+            state.expiry_ts,
+        );
+        let mut tree = zkapi_core::merkle::MerkleTree::new();
+        tree.insert(leaf);
+        let root = tree.root();
+        let siblings = tree.get_siblings(0).to_vec();
 
         let (inputs, proof) = wallet
             .withdrawal_escape_hatch(dest, root, siblings)
@@ -888,13 +1018,14 @@ mod tests {
 
     #[test]
     fn test_base64_encode() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        let engine = base64::engine::general_purpose::STANDARD;
+        assert_eq!(engine.encode(b""), "");
+        assert_eq!(engine.encode(b"f"), "Zg==");
+        assert_eq!(engine.encode(b"fo"), "Zm8=");
+        assert_eq!(engine.encode(b"foo"), "Zm9v");
+        assert_eq!(engine.encode(b"foob"), "Zm9vYg==");
+        assert_eq!(engine.encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(engine.encode(b"foobar"), "Zm9vYmFy");
     }
 
     #[test]

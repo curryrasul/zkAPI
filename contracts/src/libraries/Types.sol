@@ -5,10 +5,10 @@ pragma solidity ^0.8.28;
 library Types {
     /// @notice Lifecycle status of a note.
     enum NoteStatus {
-        Uninitialized,      // 0
-        Active,             // 1
-        PendingWithdrawal,  // 2
-        Closed              // 3
+        Uninitialized, // 0
+        Active, // 1
+        PendingWithdrawal, // 2
+        Closed // 3
     }
 
     /// @notice On-chain metadata for a deposited note.

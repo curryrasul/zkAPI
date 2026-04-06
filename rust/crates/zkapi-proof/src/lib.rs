@@ -2,14 +2,18 @@
 //!
 //! This crate provides builders that assemble the private witness fields,
 //! compute derived values (commitments, nullifiers, leaves), validate all
-//! circuit constraints locally, and produce mock proof blobs for testing.
+//! circuit constraints locally, and serialize typed proof envelopes for the
+//! Rust client/server pipeline.
 //!
-//! In a production build the `generate_mock_proof` method would be replaced
-//! by a call to the Cairo STARK prover.
+//! The production on-chain verification boundary remains the Cairo STARK
+//! adapter/fact-registry path. Off-chain, the server replays the witness from
+//! the serialized envelope before executing a request.
 
 pub mod mock;
 pub mod request;
 pub mod withdrawal;
 
-pub use request::RequestProofBuilder;
-pub use withdrawal::WithdrawalProofBuilder;
+pub use request::{verify_request_proof, RequestProofBuilder, RequestProofEnvelope};
+pub use withdrawal::{
+    verify_withdrawal_proof, WithdrawalProofBuilder, WithdrawalProofEnvelope,
+};

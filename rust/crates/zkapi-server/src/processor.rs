@@ -2,9 +2,9 @@
 //!
 //! Follows the server flow from spec section 9.3:
 //! 1. Validate public inputs against config
-//! 2. Verify the proof (mock in v1)
+//! 2. Verify the proof envelope and replay the witness locally
 //! 3. Reserve nullifier
-//! 4. Execute provider call (mock: always succeed)
+//! 4. Execute provider call
 //! 5. Compute charge, anchor, blind delta, next commitment
 //! 6. Sign the next state
 //! 7. Finalize transcript
@@ -13,9 +13,11 @@
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use zkapi_core::commitment::{compute_blind_delta, compute_next_anchor, compute_state_message};
 use zkapi_core::poseidon::{felt_to_field, field_to_felt};
 use zkapi_crypto::pedersen::PedersenCommitment;
+use zkapi_proof::verify_request_proof;
 use zkapi_types::wire::{
     ApiRequest, ClearanceRequest, ClearanceResponse, CurvePointWire, RecoveryResponse,
     RequestResponse,
@@ -25,6 +27,7 @@ use zkapi_types::{Felt252, NullifierStatus, STATEMENT_TYPE_REQUEST};
 use crate::config::ServerConfig;
 use crate::error::ServerError;
 use crate::nullifier_store::{NullifierStore, TranscriptRecord};
+use crate::provider::ApiProvider;
 use crate::signer::ServerSigner;
 
 /// The main request processor for the zkAPI server.
@@ -32,6 +35,7 @@ pub struct RequestProcessor {
     config: ServerConfig,
     store: Arc<NullifierStore>,
     signer: Arc<ServerSigner>,
+    provider: Arc<dyn ApiProvider>,
     current_root: Arc<RwLock<Felt252>>,
 }
 
@@ -41,12 +45,14 @@ impl RequestProcessor {
         config: ServerConfig,
         store: Arc<NullifierStore>,
         signer: Arc<ServerSigner>,
+        provider: Arc<dyn ApiProvider>,
         current_root: Felt252,
     ) -> Self {
         Self {
             config,
             store,
             signer,
+            provider,
             current_root: Arc::new(RwLock::new(current_root)),
         }
     }
@@ -113,11 +119,16 @@ impl RequestProcessor {
             return Err(ServerError::NoteExpired);
         }
 
-        // Step 6: Check solvency_bound matches config charge cap
-        if pi.solvency_bound < self.config.request_charge_cap {
+        // Step 6: Check solvency_bound matches the active server policy.
+        let required_solvency_bound = if self.config.policy_enabled {
+            self.config.policy_charge_cap
+        } else {
+            self.config.request_charge_cap
+        };
+        if pi.solvency_bound < required_solvency_bound {
             return Err(ServerError::InvalidRequest(format!(
                 "solvency_bound {} is less than request_charge_cap {}",
-                pi.solvency_bound, self.config.request_charge_cap
+                pi.solvency_bound, required_solvency_bound
             )));
         }
 
@@ -132,53 +143,63 @@ impl RequestProcessor {
         // Step 8: Verify state_sig_epoch/root consistency
         // For genesis (epoch 0), state_sig_root should be zero
         // For later states, epoch should match and root should match signer's root
-        if pi.state_sig_epoch != 0 {
-            if pi.state_sig_root != self.signer.state_root() {
-                return Err(ServerError::InvalidRequest(
-                    "state_sig_root does not match server's state signing root".to_string(),
-                ));
-            }
+        if pi.state_sig_epoch != 0 && pi.state_sig_root != self.signer.state_root() {
+            return Err(ServerError::InvalidRequest(
+                "state_sig_root does not match server's state signing root".to_string(),
+            ));
         }
 
-        // Step 9: Verify proof (mock for now -- always accept)
-        // In production: verify the STARK proof against the public inputs.
-        // let _proof_valid = verify_proof(&api_request.proof_envelope, &pi);
+        // Step 9: Verify the proof envelope against the stated public inputs.
+        let proof_bytes = base64::engine::general_purpose::STANDARD
+            .decode(api_request.proof_envelope.as_bytes())
+            .map_err(|e| ServerError::InvalidProof(format!("invalid base64 proof: {}", e)))?;
+        verify_request_proof(&proof_bytes, pi)
+            .map_err(|e| ServerError::InvalidProof(e.to_string()))?;
 
         // Step 10: Reserve nullifier in store
-        let reserve_result = self.store.reserve(
-            &pi.request_nullifier,
-            &api_request.client_request_id,
-            &api_request.payload_hash,
-        );
-
-        match reserve_result {
-            Ok(()) => { /* successfully reserved */ }
-            Err(ServerError::Replay) => {
-                // Check if this is an idempotent retry (same client_request_id + payload_hash)
-                if let Some(existing) =
-                    self.store.lookup_by_nullifier(&pi.request_nullifier)
-                {
-                    if existing.client_request_id.as_deref()
-                        == Some(&api_request.client_request_id)
-                        && existing.payload_hash == Some(api_request.payload_hash)
-                        && existing.status == NullifierStatus::Finalized
-                    {
-                        // Idempotent retry: return the stored response
-                        return build_response_from_record(&existing, &api_request.client_request_id);
-                    }
-                }
-                return Err(ServerError::Replay);
+        match self.store.lookup_by_nullifier(&pi.request_nullifier) {
+            Some(existing)
+                if existing.client_request_id.as_deref() == Some(&api_request.client_request_id)
+                    && existing.payload_hash == Some(api_request.payload_hash)
+                    && existing.status == NullifierStatus::Finalized =>
+            {
+                return build_response_from_record(&existing, &api_request.client_request_id);
             }
-            Err(e) => return Err(e),
+            Some(existing)
+                if existing.client_request_id.as_deref() == Some(&api_request.client_request_id)
+                    && existing.payload_hash == Some(api_request.payload_hash)
+                    && existing.status == NullifierStatus::Reserved => {}
+            Some(_) => return Err(ServerError::Replay),
+            None => self.store.reserve(
+                &pi.request_nullifier,
+                &api_request.client_request_id,
+                &api_request.payload_hash,
+            )?,
         }
 
-        // Step 11: Execute provider call (mock: always succeed with code 200)
-        let response_code: u16 = 200;
-        let response_payload = String::new(); // mock empty payload
-        let response_hash = Felt252::ZERO; // mock: hash of empty response
+        // Step 11: Execute the upstream provider call.
+        let provider_response = self.provider.execute(
+            &api_request.client_request_id,
+            &api_request.payload,
+            &api_request.payload_hash,
+        )?;
+        let response_code = provider_response.status_code;
+        let response_payload = provider_response.payload;
+        let response_hash = provider_response.response_hash;
+        let charge = provider_response.charge_applied;
 
-        // Step 12: Compute charge (mock: fixed small charge of 1)
-        let charge: u128 = 1;
+        // Step 12: Enforce the charge cap before signing a next state.
+        let max_charge = if self.config.policy_enabled {
+            self.config.policy_charge_cap
+        } else {
+            self.config.request_charge_cap
+        };
+        if charge > max_charge {
+            return Err(ServerError::Internal(format!(
+                "provider charge {} exceeds cap {}",
+                charge, max_charge
+            )));
+        }
 
         // Step 13: Sign next state to get the leaf index for anchor/blind derivation
         // First we need to compute the next commitment, anchor, etc.
@@ -281,9 +302,8 @@ impl RequestProcessor {
         // then call sign with that message. We get leaf_index from the sign result and
         // verify it matches our prediction.
         //
-        // Prediction: total_capacity - remaining = next_index
-        let predicted_leaf_index = (1u32 << zkapi_types::XMSS_TREE_HEIGHT)
-            - self.signer.state_remaining();
+        // Prediction: ask the signer for the next leaf index directly.
+        let predicted_leaf_index = self.signer.state_next_index();
 
         // Step 13: Compute blind_delta
         let blind_delta_felt = compute_blind_delta(
@@ -346,10 +366,11 @@ impl RequestProcessor {
             next_anchor: Some(next_anchor),
             blind_delta_srv: Some(blind_delta_felt),
             next_state_sig_epoch: Some(state_sig.epoch),
+            next_state_sig_root: Some(self.signer.state_root()),
             next_state_sig: Some(state_sig.clone()),
-            policy_reason_code: None,
-            policy_evidence_hash: None,
-            proof_blob: None,
+            policy_reason_code: provider_response.policy_reason_code,
+            policy_evidence_hash: provider_response.policy_evidence_hash,
+            proof_blob: Some(proof_bytes.clone()),
             request_inputs_json: serde_json::to_string(&pi).ok(),
             created_at: current_timestamp(),
             finalized_at: Some(current_timestamp()),
@@ -377,9 +398,10 @@ impl RequestProcessor {
             next_anchor,
             blind_delta_srv: blind_delta_felt,
             next_state_sig_epoch: state_sig.epoch,
+            next_state_sig_root: self.signer.state_root(),
             next_state_sig: state_sig,
-            policy_reason_code: None,
-            policy_evidence_hash: None,
+            policy_reason_code: provider_response.policy_reason_code,
+            policy_evidence_hash: provider_response.policy_evidence_hash,
         })
     }
 
@@ -416,6 +438,7 @@ impl RequestProcessor {
             status: "ok".to_string(),
             withdrawal_nullifier: *nullifier,
             clear_sig_epoch: clear_sig.epoch,
+            clear_sig_root: self.signer.clear_root(),
             clear_sig,
         })
     }
@@ -481,6 +504,7 @@ fn build_response_from_record(
         next_anchor: record.next_anchor.unwrap_or(Felt252::ZERO),
         blind_delta_srv: record.blind_delta_srv.unwrap_or(Felt252::ZERO),
         next_state_sig_epoch: record.next_state_sig_epoch.unwrap_or(0),
+        next_state_sig_root: record.next_state_sig_root.unwrap_or(Felt252::ZERO),
         next_state_sig: record
             .next_state_sig
             .clone()
