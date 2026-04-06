@@ -162,10 +162,7 @@ mod tests {
         let mut zero = 0;
         let mut current = leaf;
         let mut i: u32 = 0;
-        loop {
-            if i == 32 {
-                break;
-            }
+        while i < 32 {
             index_bits.append(0);
             siblings.append(zero);
             current = poseidon_hash_span(array![DOMAIN_NODE, current, zero].span());
