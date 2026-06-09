@@ -6,8 +6,8 @@
 pub mod config;
 pub mod error;
 pub mod nullifier_store;
-pub mod provider;
 pub mod processor;
+pub mod provider;
 pub mod routes;
 pub mod signer;
 pub mod watcher;

@@ -46,7 +46,9 @@ mod tests {
 
     #[test]
     fn test_address_roundtrip() {
-        let addr = [0xdeu8, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let addr = [
+            0xdeu8, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
         let felt = address_to_felt(&addr);
         let back = felt_to_address(&felt).unwrap();
         assert_eq!(addr, back);

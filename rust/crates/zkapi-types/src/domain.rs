@@ -44,27 +44,80 @@ pub const DOMAIN_XMSS_LEAF: Felt252 = domain_felt(b"zkapi.xmss.leaf");
 pub const DOMAIN_XMSS_NODE: Felt252 = domain_felt(b"zkapi.xmss.node");
 pub const DOMAIN_XMSS_CHAIN: Felt252 = domain_felt(b"zkapi.xmss.chain");
 pub const DOMAIN_XMSS_MSG: Felt252 = domain_felt(b"zkapi.xmss.msg");
+pub const DOMAIN_XMSS_SK: Felt252 = domain_felt(b"zkapi.xmss.sk");
 pub const DOMAIN_ANCHOR: Felt252 = domain_felt(b"zkapi.anchor");
 pub const DOMAIN_BLIND: Felt252 = domain_felt(b"zkapi.blind");
 
 /// All domain tags with their labels, for cross-system validation.
 pub const DOMAIN_TAGS: &[DomainTag] = &[
-    DomainTag { label: "zkapi.reg", felt: DOMAIN_REG },
-    DomainTag { label: "zkapi.leaf", felt: DOMAIN_LEAF },
-    DomainTag { label: "zkapi.node", felt: DOMAIN_NODE },
-    DomainTag { label: "zkapi.null", felt: DOMAIN_NULL },
-    DomainTag { label: "zkapi.state", felt: DOMAIN_STATE },
-    DomainTag { label: "zkapi.clear", felt: DOMAIN_CLEAR },
-    DomainTag { label: "zkapi.reqpub", felt: DOMAIN_REQPUB },
-    DomainTag { label: "zkapi.wdpub", felt: DOMAIN_WDPUB },
-    DomainTag { label: "zkapi.bal.g", felt: DOMAIN_BAL_G },
-    DomainTag { label: "zkapi.bal.h", felt: DOMAIN_BAL_H },
-    DomainTag { label: "zkapi.xmss.leaf", felt: DOMAIN_XMSS_LEAF },
-    DomainTag { label: "zkapi.xmss.node", felt: DOMAIN_XMSS_NODE },
-    DomainTag { label: "zkapi.xmss.chain", felt: DOMAIN_XMSS_CHAIN },
-    DomainTag { label: "zkapi.xmss.msg", felt: DOMAIN_XMSS_MSG },
-    DomainTag { label: "zkapi.anchor", felt: DOMAIN_ANCHOR },
-    DomainTag { label: "zkapi.blind", felt: DOMAIN_BLIND },
+    DomainTag {
+        label: "zkapi.reg",
+        felt: DOMAIN_REG,
+    },
+    DomainTag {
+        label: "zkapi.leaf",
+        felt: DOMAIN_LEAF,
+    },
+    DomainTag {
+        label: "zkapi.node",
+        felt: DOMAIN_NODE,
+    },
+    DomainTag {
+        label: "zkapi.null",
+        felt: DOMAIN_NULL,
+    },
+    DomainTag {
+        label: "zkapi.state",
+        felt: DOMAIN_STATE,
+    },
+    DomainTag {
+        label: "zkapi.clear",
+        felt: DOMAIN_CLEAR,
+    },
+    DomainTag {
+        label: "zkapi.reqpub",
+        felt: DOMAIN_REQPUB,
+    },
+    DomainTag {
+        label: "zkapi.wdpub",
+        felt: DOMAIN_WDPUB,
+    },
+    DomainTag {
+        label: "zkapi.bal.g",
+        felt: DOMAIN_BAL_G,
+    },
+    DomainTag {
+        label: "zkapi.bal.h",
+        felt: DOMAIN_BAL_H,
+    },
+    DomainTag {
+        label: "zkapi.xmss.leaf",
+        felt: DOMAIN_XMSS_LEAF,
+    },
+    DomainTag {
+        label: "zkapi.xmss.node",
+        felt: DOMAIN_XMSS_NODE,
+    },
+    DomainTag {
+        label: "zkapi.xmss.chain",
+        felt: DOMAIN_XMSS_CHAIN,
+    },
+    DomainTag {
+        label: "zkapi.xmss.msg",
+        felt: DOMAIN_XMSS_MSG,
+    },
+    DomainTag {
+        label: "zkapi.xmss.sk",
+        felt: DOMAIN_XMSS_SK,
+    },
+    DomainTag {
+        label: "zkapi.anchor",
+        felt: DOMAIN_ANCHOR,
+    },
+    DomainTag {
+        label: "zkapi.blind",
+        felt: DOMAIN_BLIND,
+    },
 ];
 
 #[cfg(test)]

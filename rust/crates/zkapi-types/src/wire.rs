@@ -11,6 +11,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::Felt252;
 
+/// Supported opaque proof artifact backends on the wire.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofBackendWire {
+    StwoCairo,
+}
+
+/// Opaque proof artifact sent across runtime boundaries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProofArtifactWire {
+    pub backend: ProofBackendWire,
+    pub public_output_hash: Felt252,
+    /// Base64-encoded opaque proof bytes.
+    pub proof: String,
+}
+
 /// A curve point serialized as {x, y} hex fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CurvePointWire {
@@ -61,7 +77,7 @@ pub struct ApiRequest {
     pub payload: String,
     pub payload_hash: Felt252,
     pub public_inputs: crate::RequestPublicInputs,
-    pub proof_envelope: String, // base64-encoded
+    pub proof: ProofArtifactWire,
 }
 
 /// Clearance request for mutual close.

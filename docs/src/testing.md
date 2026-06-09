@@ -7,9 +7,12 @@ The Rust workspace now covers:
 - core hash/Merkle/nullifier helpers
 - Pedersen algebra
 - WOTS+ and XMSS signing/verification
-- proof-envelope roundtrips for request and withdrawal
-- client persistence and escape-hatch proof construction
+- dev-gated proof-envelope roundtrips for request and withdrawal
+- client persistence and Stwo escape-hatch proof artifact construction
 - server nullifier storage and challenge planning
+- default client/server builds without `dev-witness-envelope`
+- real Stwo request artifact processing with recovery and challenge archive
+- real Stwo non-genesis request and mutual-close withdrawal proof artifacts
 
 Run:
 
@@ -28,7 +31,10 @@ Current coverage includes:
 - Pedersen commitment vector parity with Rust
 - Merkle path verification
 - genesis request program execution
+- non-genesis request executable proof/verify via Stwo
 - genesis escape-withdrawal program execution
+- non-genesis escape-withdrawal executable proof/verify via Stwo
+- mutual-close withdrawal executable proof/verify via Stwo
 
 Run:
 
@@ -36,6 +42,7 @@ Run:
 cd cairo
 scarb lint
 scarb test
+../scripts/prove_genesis_stwo.sh
 ```
 
 Note: `scarb test` still prints the upstream deprecation warning recommending `snforge`, but the test suite itself passes.

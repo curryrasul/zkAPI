@@ -73,7 +73,11 @@ mod tests {
 
     #[test]
     fn test_poseidon_chain() {
-        let inputs = [Felt252::from_u64(1), Felt252::from_u64(2), Felt252::from_u64(3)];
+        let inputs = [
+            Felt252::from_u64(1),
+            Felt252::from_u64(2),
+            Felt252::from_u64(3),
+        ];
         let h = poseidon_hash_chain(&DOMAIN_REG, &inputs);
         let h2 = poseidon_hash_chain(&DOMAIN_REG, &inputs);
         assert_eq!(h, h2);

@@ -108,8 +108,7 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -152,7 +151,10 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Request { payload } => {
-            println!("Sending request with payload: {}...", &payload[..payload.len().min(50)]);
+            println!(
+                "Sending request with payload: {}...",
+                &payload[..payload.len().min(50)]
+            );
             println!("(Mock mode: request would be sent to {})", cli.server_url);
         }
 

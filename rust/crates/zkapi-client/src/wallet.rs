@@ -19,17 +19,18 @@ use zkapi_core::leaf::compute_registration_commitment;
 use zkapi_core::nullifier::compute_nullifier;
 use zkapi_core::poseidon::{felt_to_field, field_to_felt};
 use zkapi_crypto::{pedersen::PedersenCommitment, xmss::XmssVerifier};
-use zkapi_proof::{RequestProofBuilder, WithdrawalProofBuilder};
+use zkapi_proof::{ProofArtifact, RequestProofBuilder, ScarbStwoProver, WithdrawalProofBuilder};
 use zkapi_types::wire::{
-    ApiRequest, ClearanceRequest, ClearanceResponse, ErrorResponse, RecoveryResponse,
-    RequestResponse,
+    ApiRequest, ClearanceRequest, ClearanceResponse, ErrorResponse, ProofArtifactWire,
+    ProofBackendWire, RecoveryResponse, RequestResponse,
 };
 use zkapi_types::{
-    Felt252, RequestPublicInputs, WithdrawalPublicInputs, MERKLE_DEPTH,
-    STATEMENT_TYPE_REQUEST, STATEMENT_TYPE_WITHDRAWAL,
+    canonical_payload_hash, canonical_response_hash, lookup_clear_root, lookup_state_root, Felt252,
+    RequestPublicInputs, WithdrawalPublicInputs, MERKLE_DEPTH, STATEMENT_TYPE_REQUEST,
+    STATEMENT_TYPE_WITHDRAWAL,
 };
 
-use crate::config::ClientConfig;
+use crate::config::{ClientConfig, ClientProofMode};
 use crate::error::ClientError;
 use crate::journal::PendingRequestJournal;
 use crate::note_state::NoteState;
@@ -173,6 +174,12 @@ impl Wallet {
         if PendingRequestJournal::read(&self.journal_path)?.is_some() {
             return Err(ClientError::PendingRequest);
         }
+        let actual_payload_hash = canonical_payload_hash(payload.as_bytes());
+        if payload_hash != actual_payload_hash {
+            return Err(ClientError::InvalidResponse(
+                "payload_hash does not match actual payload bytes".into(),
+            ));
+        }
 
         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
         let mut rng = rand::thread_rng();
@@ -210,9 +217,9 @@ impl Wallet {
                 state.state_sig_epoch.ok_or_else(|| {
                     ClientError::ProofGeneration("missing state_sig_epoch".into())
                 })?,
-                state.state_sig_root.ok_or_else(|| {
-                    ClientError::ProofGeneration("missing state_sig_root".into())
-                })?,
+                state
+                    .state_sig_root
+                    .ok_or_else(|| ClientError::ProofGeneration("missing state_sig_root".into()))?,
             )
         };
 
@@ -250,10 +257,8 @@ impl Wallet {
             state.contract_address,
             solvency,
         );
-        let proof_bytes = proof_builder
-            .generate_proof(state.state_sig.as_ref())
-            .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
-        let proof_b64 = base64::engine::general_purpose::STANDARD.encode(&proof_bytes);
+        let proof =
+            self.generate_request_proof_artifact(&proof_builder, state.state_sig.as_ref())?;
 
         // 4. Write journal.
         let client_request_id = uuid::Uuid::new_v4().to_string();
@@ -273,7 +278,7 @@ impl Wallet {
             payload: payload.to_string(),
             payload_hash,
             public_inputs,
-            proof_envelope: proof_b64,
+            proof,
         };
 
         let url = format!("{}/v1/requests", self.config.server_url);
@@ -311,8 +316,8 @@ impl Wallet {
             )));
         }
 
-        let server_resp: RequestResponse = serde_json::from_str(&body)
-            .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+        let server_resp: RequestResponse =
+            serde_json::from_str(&body).map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
 
         // 6. Verify response.
         self.verify_request_response(
@@ -356,6 +361,81 @@ impl Wallet {
         Ok(server_resp)
     }
 
+    fn generate_request_proof_artifact(
+        &self,
+        builder: &RequestProofBuilder,
+        state_sig: Option<&zkapi_types::XmssSignature>,
+    ) -> Result<ProofArtifactWire, ClientError> {
+        match &self.config.proof_mode {
+            ClientProofMode::StwoScarb { cairo_dir } => {
+                let public_inputs = builder
+                    .build_public_inputs()
+                    .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
+                let args = builder
+                    .to_cairo_args(state_sig)
+                    .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
+                let artifact = ScarbStwoProver::new(cairo_dir)
+                    .prove_and_verify_executable_with_args(
+                        "request_from_args",
+                        public_inputs.public_output_hash(),
+                        &args,
+                    )
+                    .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
+                Ok(proof_artifact_to_wire(artifact))
+            }
+            #[cfg(feature = "dev-witness-envelope")]
+            ClientProofMode::DevWitnessEnvelope => {
+                let proof = builder
+                    .generate_proof(state_sig)
+                    .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
+                let public_inputs = builder
+                    .build_public_inputs()
+                    .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
+                Ok(ProofArtifactWire {
+                    backend: ProofBackendWire::StwoCairo,
+                    public_output_hash: public_inputs.public_output_hash(),
+                    proof: base64::engine::general_purpose::STANDARD.encode(proof),
+                })
+            }
+        }
+    }
+
+    fn generate_withdrawal_proof_artifact(
+        &self,
+        builder: &WithdrawalProofBuilder,
+        state_sig: Option<&zkapi_types::XmssSignature>,
+        clear_sig: Option<&zkapi_types::XmssSignature>,
+    ) -> Result<ProofArtifactWire, ClientError> {
+        match &self.config.proof_mode {
+            ClientProofMode::StwoScarb { cairo_dir } => {
+                let public_inputs = builder.build_public_inputs();
+                let args = builder
+                    .to_cairo_args(state_sig, clear_sig)
+                    .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
+                let artifact = ScarbStwoProver::new(cairo_dir)
+                    .prove_and_verify_executable_with_args(
+                        "withdrawal_from_args",
+                        public_inputs.public_output_hash(),
+                        &args,
+                    )
+                    .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
+                Ok(proof_artifact_to_wire(artifact))
+            }
+            #[cfg(feature = "dev-witness-envelope")]
+            ClientProofMode::DevWitnessEnvelope => {
+                let proof = builder
+                    .generate_proof(state_sig, clear_sig)
+                    .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
+                let public_inputs = builder.build_public_inputs();
+                Ok(ProofArtifactWire {
+                    backend: ProofBackendWire::StwoCairo,
+                    public_output_hash: public_inputs.public_output_hash(),
+                    proof: base64::engine::general_purpose::STANDARD.encode(proof),
+                })
+            }
+        }
+    }
+
     /// Verify the server's request response (spec 10.3 step 8).
     ///
     /// Checks:
@@ -370,6 +450,13 @@ impl Wallet {
         _current_blinding: &FieldElement,
     ) -> Result<(), ClientError> {
         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
+
+        let expected_response_hash = canonical_response_hash(resp.response_payload.as_bytes());
+        if resp.response_hash != expected_response_hash {
+            return Err(ClientError::VerificationFailed(
+                "response_hash does not match response_payload".into(),
+            ));
+        }
 
         // Check charge bound.
         let max_charge = if self.config.policy_enabled {
@@ -419,6 +506,19 @@ impl Wallet {
                 "missing non-genesis state signature root/epoch".into(),
             ));
         }
+        match lookup_state_root(&self.config.trusted_epoch_roots, resp.next_state_sig_epoch) {
+            Some(root) if root == resp.next_state_sig_root => {}
+            Some(_) => {
+                return Err(ClientError::VerificationFailed(
+                    "state signature root does not match trusted epoch registry".into(),
+                ));
+            }
+            None => {
+                return Err(ClientError::VerificationFailed(
+                    "state signature epoch is not trusted".into(),
+                ));
+            }
+        }
         if resp.next_state_sig.epoch != resp.next_state_sig_epoch {
             return Err(ClientError::VerificationFailed(format!(
                 "state sig epoch mismatch: {} != {}",
@@ -456,13 +556,13 @@ impl Wallet {
     /// 1. Compute withdrawal nullifier.
     /// 2. Request clearance from server.
     /// 3. Build withdrawal proof with `has_clearance = true`.
-    /// 4. Return `(WithdrawalPublicInputs, proof_bytes)` for on-chain submission.
+    /// 4. Return `(WithdrawalPublicInputs, proof_artifact)` for on-chain submission.
     pub async fn withdrawal_mutual_close(
         &mut self,
         destination: [u8; 20],
         active_root: Felt252,
         merkle_siblings: Vec<Felt252>,
-    ) -> Result<(WithdrawalPublicInputs, Vec<u8>), ClientError> {
+    ) -> Result<(WithdrawalPublicInputs, ProofArtifactWire), ClientError> {
         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
         let siblings = siblings_from_vec(merkle_siblings)?;
 
@@ -480,9 +580,9 @@ impl Wallet {
                 state.state_sig_epoch.ok_or_else(|| {
                     ClientError::ProofGeneration("missing state_sig_epoch".into())
                 })?,
-                state.state_sig_root.ok_or_else(|| {
-                    ClientError::ProofGeneration("missing state_sig_root".into())
-                })?,
+                state
+                    .state_sig_root
+                    .ok_or_else(|| ClientError::ProofGeneration("missing state_sig_root".into()))?,
             )
         };
 
@@ -526,11 +626,13 @@ impl Wallet {
             state.chain_id,
             state.contract_address,
         );
-        let proof_bytes = proof_builder
-            .generate_proof(state.state_sig.as_ref(), Some(&clearance.clear_sig))
-            .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
+        let proof = self.generate_withdrawal_proof_artifact(
+            &proof_builder,
+            state.state_sig.as_ref(),
+            Some(&clearance.clear_sig),
+        )?;
 
-        Ok((public_inputs, proof_bytes))
+        Ok((public_inputs, proof))
     }
 
     // ------------------------------------------------------------------
@@ -539,14 +641,14 @@ impl Wallet {
 
     /// Execute an escape-hatch withdrawal (no server clearance).
     ///
-    /// Returns `(WithdrawalPublicInputs, proof_bytes)` for on-chain
+    /// Returns `(WithdrawalPublicInputs, proof_artifact)` for on-chain
     /// `initiateEscapeWithdrawal`.
     pub fn withdrawal_escape_hatch(
         &self,
         destination: [u8; 20],
         active_root: Felt252,
         merkle_siblings: Vec<Felt252>,
-    ) -> Result<(WithdrawalPublicInputs, Vec<u8>), ClientError> {
+    ) -> Result<(WithdrawalPublicInputs, ProofArtifactWire), ClientError> {
         let state = self.state.as_ref().ok_or(ClientError::NoActiveNote)?;
         let siblings = siblings_from_vec(merkle_siblings)?;
 
@@ -560,9 +662,9 @@ impl Wallet {
                 state.state_sig_epoch.ok_or_else(|| {
                     ClientError::ProofGeneration("missing state_sig_epoch".into())
                 })?,
-                state.state_sig_root.ok_or_else(|| {
-                    ClientError::ProofGeneration("missing state_sig_root".into())
-                })?,
+                state
+                    .state_sig_root
+                    .ok_or_else(|| ClientError::ProofGeneration("missing state_sig_root".into()))?,
             )
         };
 
@@ -607,11 +709,13 @@ impl Wallet {
             state.chain_id,
             state.contract_address,
         );
-        let proof_bytes = proof_builder
-            .generate_proof(state.state_sig.as_ref(), None)
-            .map_err(|e| ClientError::ProofGeneration(e.to_string()))?;
+        let proof = self.generate_withdrawal_proof_artifact(
+            &proof_builder,
+            state.state_sig.as_ref(),
+            None,
+        )?;
 
-        Ok((public_inputs, proof_bytes))
+        Ok((public_inputs, proof))
     }
 
     /// Archive the note state after a successful close.
@@ -656,8 +760,8 @@ impl Wallet {
             .await
             .map_err(|e| ClientError::ServerError(e.to_string()))?;
 
-        let recovery: RecoveryResponse = serde_json::from_str(&body)
-            .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+        let recovery: RecoveryResponse =
+            serde_json::from_str(&body).map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
 
         match recovery.nullifier_status.as_str() {
             "finalized" => {
@@ -683,14 +787,14 @@ impl Wallet {
                 )?;
 
                 let charge = server_resp.charge_applied;
-                let next_balance = state.current_balance.checked_sub(charge).ok_or_else(|| {
-                    ClientError::InvalidResponse("charge exceeds balance".into())
-                })?;
+                let next_balance = state
+                    .current_balance
+                    .checked_sub(charge)
+                    .ok_or_else(|| ClientError::InvalidResponse("charge exceeds balance".into()))?;
 
                 let blind_delta_srv = felt_to_field(&server_resp.blind_delta_srv);
                 let next_blinding = current_blinding + user_rerandomization + blind_delta_srv;
-                let next_blinding_hex =
-                    format!("0x{}", hex::encode(next_blinding.to_bytes_be()));
+                let next_blinding_hex = format!("0x{}", hex::encode(next_blinding.to_bytes_be()));
 
                 let mut next_state = state.clone();
                 next_state.current_balance = next_balance;
@@ -769,6 +873,19 @@ impl Wallet {
                 "clearance response missing clear_sig_root".into(),
             ));
         }
+        match lookup_clear_root(&self.config.trusted_epoch_roots, clearance.clear_sig_epoch) {
+            Some(root) if root == clearance.clear_sig_root => {}
+            Some(_) => {
+                return Err(ClientError::VerificationFailed(
+                    "clearance root does not match trusted epoch registry".into(),
+                ));
+            }
+            None => {
+                return Err(ClientError::VerificationFailed(
+                    "clearance epoch is not trusted".into(),
+                ));
+            }
+        }
         if clearance.clear_sig.epoch != clearance.clear_sig_epoch {
             return Err(ClientError::VerificationFailed(format!(
                 "clearance signature epoch mismatch: {} != {}",
@@ -839,9 +956,7 @@ fn now_ms() -> u64 {
 
 /// Convert a sibling vector from the indexer into the fixed-size array used
 /// throughout the proof code.
-fn siblings_from_vec(
-    siblings: Vec<Felt252>,
-) -> Result<[Felt252; MERKLE_DEPTH], ClientError> {
+fn siblings_from_vec(siblings: Vec<Felt252>) -> Result<[Felt252; MERKLE_DEPTH], ClientError> {
     siblings.try_into().map_err(|v: Vec<Felt252>| {
         ClientError::ProofGeneration(format!(
             "expected {} merkle siblings, got {}",
@@ -849,6 +964,14 @@ fn siblings_from_vec(
             v.len()
         ))
     })
+}
+
+fn proof_artifact_to_wire(artifact: ProofArtifact) -> ProofArtifactWire {
+    ProofArtifactWire {
+        backend: ProofBackendWire::StwoCairo,
+        public_output_hash: artifact.public_output_hash,
+        proof: base64::engine::general_purpose::STANDARD.encode(artifact.proof),
+    }
 }
 
 #[cfg(test)]
@@ -875,6 +998,27 @@ mod tests {
             policy_enabled: false,
             server_url: "http://localhost:9999".to_string(),
             state_dir: test_dir(name),
+            trusted_epoch_roots: Vec::new(),
+            proof_mode: test_proof_mode(),
+        }
+    }
+
+    fn test_proof_mode() -> ClientProofMode {
+        #[cfg(feature = "dev-witness-envelope")]
+        {
+            ClientProofMode::DevWitnessEnvelope
+        }
+        #[cfg(not(feature = "dev-witness-envelope"))]
+        {
+            let cairo_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../cairo")
+                .canonicalize()
+                .unwrap_or_else(|_| {
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../cairo")
+                });
+            ClientProofMode::StwoScarb {
+                cairo_dir: cairo_dir.to_string_lossy().to_string(),
+            }
         }
     }
 
@@ -908,7 +1052,9 @@ mod tests {
         let (secret, _) = wallet.generate_deposit_params();
         wallet.confirm_deposit(secret, 0, 1000, 1700000000).unwrap();
 
-        let err = wallet.confirm_deposit(secret, 1, 500, 1700000000).unwrap_err();
+        let err = wallet
+            .confirm_deposit(secret, 1, 500, 1700000000)
+            .unwrap_err();
         assert!(matches!(err, ClientError::NoteAlreadyExists));
     }
 
@@ -919,7 +1065,9 @@ mod tests {
         let (secret, _) = wallet.generate_deposit_params();
         wallet.confirm_deposit(secret, 0, 1000, 1700000000).unwrap();
 
-        let dest = [0xdeu8, 0xad, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dest = [
+            0xdeu8, 0xad, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
         let state = wallet.state().unwrap().clone();
         let commitment = compute_registration_commitment(&state.secret_s);
         let leaf = zkapi_core::leaf::compute_note_leaf(
@@ -943,7 +1091,7 @@ mod tests {
         assert_eq!(inputs.destination, dest);
         assert_eq!(inputs.clear_sig_epoch, 0);
         assert_eq!(inputs.clear_sig_root, Felt252::ZERO);
-        assert!(!proof.is_empty());
+        assert!(!proof.proof.is_empty());
     }
 
     #[test]
@@ -959,6 +1107,8 @@ mod tests {
                 policy_enabled: false,
                 server_url: "http://localhost:1".to_string(),
                 state_dir: state_dir.clone(),
+                trusted_epoch_roots: Vec::new(),
+                proof_mode: test_proof_mode(),
             };
             let mut wallet = Wallet::new(config).unwrap();
             let (secret, _) = wallet.generate_deposit_params();
@@ -975,6 +1125,8 @@ mod tests {
                 policy_enabled: false,
                 server_url: "http://localhost:1".to_string(),
                 state_dir,
+                trusted_epoch_roots: Vec::new(),
+                proof_mode: test_proof_mode(),
             };
             let wallet = Wallet::new(config).unwrap();
             let state = wallet.state().unwrap();
@@ -1026,6 +1178,88 @@ mod tests {
         assert_eq!(engine.encode(b"foob"), "Zm9vYg==");
         assert_eq!(engine.encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(engine.encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn test_response_hash_mismatch_is_rejected() {
+        let mut config = test_config("bad_response_hash");
+        config.trusted_epoch_roots = vec![zkapi_types::EpochRoots {
+            epoch: 1,
+            state_root: Felt252::from_u64(0xabc),
+            clear_root: Felt252::from_u64(0xdef),
+        }];
+        let mut wallet = Wallet::new(config).unwrap();
+        let secret = Felt252::from_u64(55);
+        wallet
+            .confirm_deposit(secret, 0, 1000, 2_000_000_000)
+            .unwrap();
+
+        let blinding = FieldElement::ZERO;
+        let anon = PedersenCommitment::commit(1000, &blinding);
+        let mut response = trusted_shape_response(Felt252::from_u64(0xabc), "payload");
+        response.response_hash = Felt252::from_u64(0xbad);
+
+        let err = wallet
+            .verify_request_response(&response, &anon, &FieldElement::ZERO, &blinding)
+            .unwrap_err();
+        assert!(
+            matches!(err, ClientError::VerificationFailed(msg) if msg.contains("response_hash"))
+        );
+    }
+
+    #[test]
+    fn test_unpublished_state_root_is_rejected_before_xmss_verify() {
+        let config = test_config("unpublished_root");
+        let mut wallet = Wallet::new(config).unwrap();
+        let secret = Felt252::from_u64(56);
+        wallet
+            .confirm_deposit(secret, 0, 1000, 2_000_000_000)
+            .unwrap();
+
+        let blinding = FieldElement::ZERO;
+        let anon = PedersenCommitment::commit(1000, &blinding);
+        let response = trusted_shape_response(Felt252::from_u64(0xabc), "payload");
+
+        let err = wallet
+            .verify_request_response(&response, &anon, &FieldElement::ZERO, &blinding)
+            .unwrap_err();
+        assert!(
+            matches!(err, ClientError::VerificationFailed(msg) if msg.contains("epoch is not trusted"))
+        );
+    }
+
+    fn trusted_shape_response(state_root: Felt252, payload: &str) -> RequestResponse {
+        let blind_delta = Felt252::from_u64(7);
+        let anon = PedersenCommitment::commit(1000, &FieldElement::ZERO);
+        let updated =
+            PedersenCommitment::server_update(&anon.point, 1, &felt_to_field(&blind_delta));
+        let (x, y) = updated.to_affine();
+
+        RequestResponse {
+            status: "ok".to_string(),
+            client_request_id: "test-request".to_string(),
+            request_nullifier: Felt252::from_u64(1),
+            response_code: 200,
+            response_payload: payload.to_string(),
+            response_hash: canonical_response_hash(payload.as_bytes()),
+            charge_applied: 1,
+            next_commitment: zkapi_types::wire::CurvePointWire {
+                x: field_to_felt(&x),
+                y: field_to_felt(&y),
+            },
+            next_anchor: Felt252::from_u64(9),
+            blind_delta_srv: blind_delta,
+            next_state_sig_epoch: 1,
+            next_state_sig_root: state_root,
+            next_state_sig: zkapi_types::XmssSignature {
+                epoch: 1,
+                leaf_index: 0,
+                wots_sig: vec![Felt252::ZERO; zkapi_types::WOTS_LEN],
+                auth_path: vec![Felt252::ZERO; zkapi_types::XMSS_TREE_HEIGHT],
+            },
+            policy_reason_code: None,
+            policy_evidence_hash: None,
+        }
     }
 
     #[test]

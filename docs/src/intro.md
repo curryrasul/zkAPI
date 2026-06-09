@@ -13,7 +13,7 @@ It is written as an implementation companion:
 ```text
 cairo/      Cairo proof programs and PQ signature logic
 contracts/  Solidity vault and proof adapters
-rust/       Client SDK, server, proof envelopes, indexer, crypto helpers
+rust/       Client SDK, server, proof artifacts, indexer, crypto helpers
 ```
 
 ## Security Model

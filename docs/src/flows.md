@@ -4,8 +4,8 @@
 
 ```mermaid
 flowchart LR
-    A["Client note state"] --> B["Build request proof envelope"]
-    B --> C["Server verifies envelope"]
+    A["Client note state"] --> B["Build request proof artifact"]
+    B --> C["Server verifies proof artifact and public outputs"]
     C --> D["Reserve nullifier"]
     D --> E["Execute provider"]
     E --> F["Compute charge, blind delta, next anchor"]
@@ -20,12 +20,12 @@ flowchart LR
 2. Client requests server clearance.
 3. Server signs the clearance message with its clearance XMSS tree.
 4. Client verifies the clearance signature.
-5. Client builds a withdrawal proof envelope with `has_clearance = true`.
+5. Client builds a withdrawal proof artifact with `has_clearance = true`.
 6. Contract verifies the withdrawal statement through the adapter and settles immediately.
 
 ## Escape Hatch
 
-1. Client builds a withdrawal proof envelope with `has_clearance = false`.
+1. Client builds a withdrawal proof artifact with `has_clearance = false`.
 2. Contract removes the note leaf immediately and stores pending withdrawal data.
 3. If the withdrawal is stale, the server reconstructs a challenge from the archived request transcript.
 4. `challengeEscapeWithdrawal` restores the original leaf.

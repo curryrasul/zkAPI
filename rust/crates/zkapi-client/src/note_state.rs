@@ -79,12 +79,7 @@ impl NoteState {
     /// Per spec section 8.2 constraint 9:
     /// - When policy is disabled: `solvency_bound = request_charge_cap`
     /// - When policy is enabled: `solvency_bound = policy_charge_cap`
-    pub fn solvency_bound(
-        &self,
-        policy_enabled: bool,
-        charge_cap: u128,
-        policy_cap: u128,
-    ) -> u128 {
+    pub fn solvency_bound(&self, policy_enabled: bool, charge_cap: u128, policy_cap: u128) -> u128 {
         if policy_enabled {
             policy_cap
         } else {
@@ -126,10 +121,7 @@ impl NoteState {
         let archive_dir = parent.join("archive");
         fs::create_dir_all(&archive_dir)?;
 
-        let filename = format!(
-            "note_{}_closed.json",
-            self.note_id
-        );
+        let filename = format!("note_{}_closed.json", self.note_id);
         let archive_path = archive_dir.join(filename);
 
         // Save a copy to the archive, then remove the active state file.
@@ -176,8 +168,16 @@ mod tests {
     #[test]
     fn test_solvency_bound_policy_disabled() {
         let state = NoteState::new_from_deposit(
-            1, 1, Felt252::ZERO, 0, Felt252::from_u64(1),
-            1000, 0, "0x0".into(), Felt252::ZERO, Felt252::ZERO,
+            1,
+            1,
+            Felt252::ZERO,
+            0,
+            Felt252::from_u64(1),
+            1000,
+            0,
+            "0x0".into(),
+            Felt252::ZERO,
+            Felt252::ZERO,
         );
         assert_eq!(state.solvency_bound(false, 100, 50), 100);
     }
@@ -185,8 +185,16 @@ mod tests {
     #[test]
     fn test_solvency_bound_policy_enabled() {
         let state = NoteState::new_from_deposit(
-            1, 1, Felt252::ZERO, 0, Felt252::from_u64(1),
-            1000, 0, "0x0".into(), Felt252::ZERO, Felt252::ZERO,
+            1,
+            1,
+            Felt252::ZERO,
+            0,
+            Felt252::from_u64(1),
+            1000,
+            0,
+            "0x0".into(),
+            Felt252::ZERO,
+            Felt252::ZERO,
         );
         assert_eq!(state.solvency_bound(true, 100, 50), 50);
     }
@@ -196,9 +204,16 @@ mod tests {
         let dir = test_dir("save_load");
         let path = dir.join("note_state.json");
         let state = NoteState::new_from_deposit(
-            1, 1, Felt252::from_u64(0xdead), 7, Felt252::from_u64(42),
-            5000, 1700000000, "0xff".to_string(),
-            Felt252::from_u64(10), Felt252::from_u64(20),
+            1,
+            1,
+            Felt252::from_u64(0xdead),
+            7,
+            Felt252::from_u64(42),
+            5000,
+            1700000000,
+            "0xff".to_string(),
+            Felt252::from_u64(10),
+            Felt252::from_u64(20),
         );
         state.save(&path).unwrap();
         let loaded = NoteState::load(&path).unwrap();
@@ -212,8 +227,16 @@ mod tests {
         let dir = test_dir("archive");
         let path = dir.join("note_state.json");
         let state = NoteState::new_from_deposit(
-            1, 1, Felt252::ZERO, 3, Felt252::from_u64(1),
-            100, 0, "0x0".into(), Felt252::ZERO, Felt252::ZERO,
+            1,
+            1,
+            Felt252::ZERO,
+            3,
+            Felt252::from_u64(1),
+            100,
+            0,
+            "0x0".into(),
+            Felt252::ZERO,
+            Felt252::ZERO,
         );
         state.save(&path).unwrap();
         assert!(path.exists());

@@ -14,9 +14,35 @@ pub mod wire;
 
 pub use domain::{DomainTag, DOMAIN_TAGS};
 pub use felt::Felt252;
-pub use inputs::{RequestPublicInputs, WithdrawalPublicInputs};
+pub use inputs::{
+    canonical_payload_hash, canonical_response_hash, public_output_hash_from_cairo_outputs,
+    request_public_output_hash_from_outputs, withdrawal_public_output_hash_from_outputs,
+    RequestPublicInputs, WithdrawalPublicInputs,
+};
 pub use note::{Note, NoteStatus, NullifierStatus, PendingWithdrawal};
 pub use signature::XmssSignature;
+
+/// Published server signing roots for one epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochRoots {
+    pub epoch: u32,
+    pub state_root: Felt252,
+    pub clear_root: Felt252,
+}
+
+pub fn lookup_state_root(roots: &[EpochRoots], epoch: u32) -> Option<Felt252> {
+    roots
+        .iter()
+        .find(|entry| entry.epoch == epoch)
+        .map(|entry| entry.state_root)
+}
+
+pub fn lookup_clear_root(roots: &[EpochRoots], epoch: u32) -> Option<Felt252> {
+    roots
+        .iter()
+        .find(|entry| entry.epoch == epoch)
+        .map(|entry| entry.clear_root)
+}
 
 /// Protocol version for v1.
 pub const PROTOCOL_VERSION: u16 = 1;

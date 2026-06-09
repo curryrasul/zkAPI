@@ -5,20 +5,23 @@
 //! commitment), validates constraints locally, and can emit a mock proof
 //! blob for testing.
 
+#[cfg(feature = "dev-witness-envelope")]
 use serde::{Deserialize, Serialize};
-use zkapi_core::poseidon::FieldElement;
 use thiserror::Error;
+use zkapi_core::poseidon::FieldElement;
 
 use zkapi_core::commitment::compute_state_message;
 use zkapi_core::leaf::{compute_note_leaf, compute_registration_commitment};
 use zkapi_core::merkle::verify_membership;
 use zkapi_core::nullifier::compute_nullifier;
-use zkapi_core::poseidon::{felt_to_field, field_to_felt};
+#[cfg(feature = "dev-witness-envelope")]
+use zkapi_core::poseidon::felt_to_field;
+use zkapi_core::poseidon::field_to_felt;
 use zkapi_crypto::pedersen::PedersenCommitment;
 use zkapi_crypto::xmss::XmssVerifier;
 use zkapi_types::{
     Felt252, RequestPublicInputs, XmssSignature, GENESIS_ANCHOR, MERKLE_DEPTH,
-    STATEMENT_TYPE_REQUEST,
+    STATEMENT_TYPE_REQUEST, WOTS_LEN, XMSS_TREE_HEIGHT,
 };
 
 use crate::mock::MOCK_PROOF_ENVELOPE;
@@ -84,6 +87,7 @@ pub enum RequestProofError {
 /// The on-chain verifier boundary is still the Cairo fact/verifier adapter.
 /// Off-chain we carry the full witness so the server can re-run the same
 /// constraints before executing the request.
+#[cfg(feature = "dev-witness-envelope")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestProofEnvelope {
     pub public_inputs: RequestPublicInputs,
@@ -224,6 +228,50 @@ impl RequestProofBuilder {
         })
     }
 
+    /// Serialize this witness into the flat felt argument vector consumed by the
+    /// `request_from_args` Cairo executable.
+    pub fn to_cairo_args(
+        &self,
+        state_sig: Option<&XmssSignature>,
+    ) -> Result<Vec<Felt252>, RequestProofError> {
+        self.validate_with_signature(state_sig)?;
+
+        let mut args = vec![
+            Felt252::from_u64(self.protocol_version as u64),
+            Felt252::from_u64(self.chain_id),
+            self.contract_address,
+            self.active_root,
+            Felt252::from_u128(self.solvency_bound),
+            self.secret_s,
+            Felt252::from_u64(self.note_id as u64),
+            Felt252::from_u128(self.deposit_amount),
+            Felt252::from_u64(self.expiry_ts),
+        ];
+        args.extend(merkle_index_bits(self.note_id));
+        args.extend(self.merkle_siblings);
+        args.extend([
+            Felt252::from_u128(self.current_balance),
+            field_to_felt(&self.current_blinding),
+            field_to_felt(&self.user_rerandomization),
+            self.current_anchor,
+            Felt252::from_u64(self.is_genesis as u64),
+            self.state_sig_root,
+            Felt252::from_u64(self.state_sig_epoch as u64),
+        ]);
+
+        if let Some(sig) = state_sig {
+            args.push(Felt252::from_u64(sig.leaf_index as u64));
+            args.extend(sig.wots_sig.iter().copied());
+            args.extend(sig.auth_path.iter().copied());
+        } else {
+            args.push(Felt252::ZERO);
+            args.extend(std::iter::repeat_n(Felt252::ZERO, WOTS_LEN));
+            args.extend(std::iter::repeat_n(Felt252::ZERO, XMSS_TREE_HEIGHT));
+        }
+
+        Ok(args)
+    }
+
     // -- validation ----------------------------------------------------
 
     /// Run all circuit-equivalent constraint checks locally.
@@ -240,7 +288,12 @@ impl RequestProofBuilder {
 
         // 2-3. Leaf membership in active_root.
         let leaf = self.note_leaf();
-        if !verify_membership(&self.active_root, self.note_id, &leaf, &self.merkle_siblings) {
+        if !verify_membership(
+            &self.active_root,
+            self.note_id,
+            &leaf,
+            &self.merkle_siblings,
+        ) {
             return Err(RequestProofError::MerkleProofInvalid);
         }
 
@@ -270,8 +323,8 @@ impl RequestProofBuilder {
             if self.state_sig_root.is_zero() {
                 return Err(RequestProofError::NonGenesisRootZero);
             }
-            // NOTE: actual XMSS signature verification is not performed here;
-            // that is the responsibility of the Cairo program.
+            // Structural checks live here; full XMSS verification is performed
+            // by validate_with_signature once the private signature is supplied.
         }
 
         // 8. Solvency: current_balance >= solvency_bound.
@@ -309,8 +362,7 @@ impl RequestProofBuilder {
                 actual: sig.epoch,
             });
         }
-        sig.validate()
-            .map_err(RequestProofError::StateSignatureInvalid)?;
+        validate_xmss_signature(sig).map_err(RequestProofError::StateSignatureInvalid)?;
 
         let commitment = PedersenCommitment::commit(self.current_balance, &self.current_blinding);
         let (current_x, current_y) = commitment.to_affine();
@@ -322,7 +374,7 @@ impl RequestProofBuilder {
             &field_to_felt(&current_y),
             &self.current_anchor,
         );
-        if !XmssVerifier::verify(&self.state_sig_root, &state_msg, sig) {
+        if !verify_xmss_signature(&self.state_sig_root, &state_msg, sig) {
             return Err(RequestProofError::StateSignatureInvalid(
                 "XMSS root/path verification failed".to_string(),
             ));
@@ -332,6 +384,7 @@ impl RequestProofBuilder {
     }
 
     /// Build a serialized witness envelope that the server can verify.
+    #[cfg(feature = "dev-witness-envelope")]
     pub fn build_envelope(
         &self,
         state_sig: Option<&XmssSignature>,
@@ -355,13 +408,13 @@ impl RequestProofBuilder {
     }
 
     /// Serialize the proof envelope as JSON bytes.
+    #[cfg(feature = "dev-witness-envelope")]
     pub fn generate_proof(
         &self,
         state_sig: Option<&XmssSignature>,
     ) -> Result<Vec<u8>, RequestProofError> {
         let envelope = self.build_envelope(state_sig)?;
-        serde_json::to_vec(&envelope)
-            .map_err(|e| RequestProofError::Serialization(e.to_string()))
+        serde_json::to_vec(&envelope).map_err(|e| RequestProofError::Serialization(e.to_string()))
     }
 
     // -- mock proof ----------------------------------------------------
@@ -375,6 +428,7 @@ impl RequestProofBuilder {
 }
 
 /// Verify a serialized request proof envelope against expected public inputs.
+#[cfg(feature = "dev-witness-envelope")]
 pub fn verify_request_proof(
     proof: &[u8],
     expected_inputs: &RequestPublicInputs,
@@ -413,11 +467,37 @@ pub fn verify_request_proof(
     builder.validate_with_signature(envelope.state_sig.as_ref())
 }
 
+#[cfg(not(test))]
+fn validate_xmss_signature(sig: &XmssSignature) -> Result<(), String> {
+    sig.validate()
+}
+
+#[cfg(test)]
+fn validate_xmss_signature(sig: &XmssSignature) -> Result<(), String> {
+    sig.validate_for_height(sig.auth_path.len())
+}
+
+#[cfg(not(test))]
+fn verify_xmss_signature(root: &Felt252, message: &Felt252, sig: &XmssSignature) -> bool {
+    XmssVerifier::verify(root, message, sig)
+}
+
+#[cfg(test)]
+fn verify_xmss_signature(root: &Felt252, message: &Felt252, sig: &XmssSignature) -> bool {
+    XmssVerifier::verify_for_height(root, message, sig, sig.auth_path.len())
+}
+
+fn merkle_index_bits(index: u32) -> impl Iterator<Item = Felt252> {
+    (0..MERKLE_DEPTH).map(move |level| Felt252::from_u64(((index >> level) & 1) as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "dev-witness-envelope")]
     use zkapi_core::commitment::compute_state_message;
     use zkapi_core::merkle::MerkleTree;
+    #[cfg(feature = "dev-witness-envelope")]
     use zkapi_crypto::xmss::XmssKeypair;
 
     /// Helper: build a minimal genesis witness that should pass validation.
@@ -436,22 +516,22 @@ mod tests {
 
         RequestProofBuilder::new(
             secret,
-            0,                          // note_id
+            0, // note_id
             deposit,
             expiry,
             siblings,
-            deposit,                    // current_balance == deposit for genesis
-            FieldElement::ZERO,         // current_blinding
-            FieldElement::from(7u64),   // user_rerandomization
+            deposit,                           // current_balance == deposit for genesis
+            FieldElement::ZERO,                // current_blinding
+            FieldElement::from(7u64),          // user_rerandomization
             Felt252::from_u64(GENESIS_ANCHOR), // current_anchor = 1
-            true,                       // is_genesis
-            0,                          // state_sig_epoch
-            Felt252::ZERO,              // state_sig_root
-            root,                       // active_root
-            1,                          // protocol_version
-            1,                          // chain_id
-            Felt252::from_u64(0xdead),  // contract_address
-            100,                        // solvency_bound
+            true,                              // is_genesis
+            0,                                 // state_sig_epoch
+            Felt252::ZERO,                     // state_sig_root
+            root,                              // active_root
+            1,                                 // protocol_version
+            1,                                 // chain_id
+            Felt252::from_u64(0xdead),         // contract_address
+            100,                               // solvency_bound
         )
     }
 
@@ -464,7 +544,9 @@ mod tests {
     #[test]
     fn test_build_public_inputs() {
         let builder = genesis_builder();
-        let pi = builder.build_public_inputs().expect("should build public inputs");
+        let pi = builder
+            .build_public_inputs()
+            .expect("should build public inputs");
         assert_eq!(pi.statement_type, STATEMENT_TYPE_REQUEST);
         assert_eq!(pi.protocol_version, 1);
         assert_eq!(pi.chain_id, 1);
@@ -472,6 +554,17 @@ mod tests {
         assert_eq!(pi.solvency_bound, 100);
         assert!(!pi.request_nullifier.is_zero());
         assert!(!pi.anon_commitment_x.is_zero());
+    }
+
+    #[test]
+    fn test_cairo_args_for_genesis_request() {
+        let builder = genesis_builder();
+        let args = builder.to_cairo_args(None).unwrap();
+        assert_eq!(args.len(), 166);
+        assert_eq!(args[0], Felt252::from_u64(1));
+        assert_eq!(args[9], Felt252::ZERO);
+        assert_eq!(args[77], Felt252::ONE);
+        assert_eq!(args[80], Felt252::ZERO);
     }
 
     #[test]
@@ -537,6 +630,7 @@ mod tests {
         assert!(matches!(err, RequestProofError::NonGenesisRootZero));
     }
 
+    #[cfg(feature = "dev-witness-envelope")]
     #[test]
     fn test_real_proof_roundtrip_non_genesis() {
         let mut builder = genesis_builder();
@@ -550,7 +644,8 @@ mod tests {
         builder.state_sig_epoch = 7;
         builder.state_sig_root = keypair.root_felt();
 
-        let commitment = PedersenCommitment::commit(builder.current_balance, &builder.current_blinding);
+        let commitment =
+            PedersenCommitment::commit(builder.current_balance, &builder.current_blinding);
         let (cx, cy) = commitment.to_affine();
         let state_msg = compute_state_message(
             builder.protocol_version,

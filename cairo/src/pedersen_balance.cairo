@@ -11,39 +11,110 @@
 // reference implementation from the labels "zkapi.bal.g" and "zkapi.bal.h".
 // These exact affine coordinates are mirrored here so Cairo and Rust commit to
 // the same curve points.
+//
+// This module intentionally avoids `core::ec`. Scarb/Stwo currently routes
+// that API through the `ecdsa_builtin`, which the Stwo adapter does not support.
+// The small affine formulas below keep the proof statement in ordinary field
+// arithmetic so request proofs can be executed by Stwo.
 
-use core::ec::{EcPointTrait, EcStateTrait, NonZeroEcPoint};
+use core::felt252_div;
+use core::num::traits::DivRem;
+use core::zeroable::NonZero;
 
 // ---------------------------------------------------------------------------
 // Generator points
 // ---------------------------------------------------------------------------
 
 // G_balance generator coordinates.
-const G_BALANCE_X: felt252 = 0x53650b4a2cbf80864a1894814abdf4934b4ef43d76a706910f7f00c0a21afe0;
-const G_BALANCE_Y: felt252 = 0x55d2a6c23b4df3e262e0b1bbf6fe31eb1b7ebfddc872c863363be9b00b1a296;
+const G_BALANCE_X: felt252 = 0x2e60e3230fe061dbebac8fd2cfa503e4eb92783aeb5fd6fb931a66ee277e4d3;
+const G_BALANCE_Y: felt252 = 0x39289536a4fb4c04778f51eed313db47730cf86d342fd3f80f27bed1c2febac;
 
 // H_blind generator coordinates.
-const H_BLIND_X: felt252 = 0x3069b52abc79afae06c83bb31d22950113be4ef840dcd3fd10e838c877e6da0;
-const H_BLIND_Y: felt252 = 0x1efd6a8a9529d70de816b1b5f2cd0c81f32b1bba07d98d5b728e1ec37ea4b83;
+const H_BLIND_X: felt252 = 0x9ed31288dc3e29f8759144b455aa05f39eee1a947e92fc1a9d71d15ed49faa;
+const H_BLIND_Y: felt252 = 0x73853a56a47d4dbeaf5c18ca78fbf64f414d5fccefaac0227d5c2654d2ca9b4;
+
+fn point_double(is_inf: bool, x: felt252, y: felt252) -> (bool, felt252, felt252) {
+    if is_inf {
+        return (true, 0, 0);
+    }
+    if y == 0 {
+        return (true, 0, 0);
+    }
+
+    // Stark curve: y^2 = x^3 + x + beta.
+    let denominator: NonZero<felt252> = (2 * y).try_into().expect('zero denominator');
+    let slope = felt252_div((3 * x * x) + 1, denominator);
+    let x3 = (slope * slope) - x - x;
+    let y3 = (slope * (x - x3)) - y;
+    (false, x3, y3)
+}
+
+fn point_add(
+    p_inf: bool, px: felt252, py: felt252, q_inf: bool, qx: felt252, qy: felt252,
+) -> (bool, felt252, felt252) {
+    if p_inf {
+        return (q_inf, qx, qy);
+    }
+    if q_inf {
+        return (p_inf, px, py);
+    }
+    if px == qx {
+        if py == qy {
+            return point_double(p_inf, px, py);
+        }
+        return (true, 0, 0);
+    }
+
+    let denominator: NonZero<felt252> = (qx - px).try_into().expect('zero denominator');
+    let slope = felt252_div(qy - py, denominator);
+    let x3 = (slope * slope) - px - qx;
+    let y3 = (slope * (px - x3)) - py;
+    (false, x3, y3)
+}
+
+fn scalar_mul(point_x: felt252, point_y: felt252, scalar: felt252) -> (bool, felt252, felt252) {
+    let mut result_inf = true;
+    let mut result_x = 0;
+    let mut result_y = 0;
+    let mut addend_inf = false;
+    let mut addend_x = point_x;
+    let mut addend_y = point_y;
+    let mut remaining: u256 = scalar.into();
+    let two: NonZero<u256> = 2_u256.try_into().unwrap();
+    let mut i: u32 = 0;
+
+    while i < 252 {
+        let (next_remaining, bit) = DivRem::div_rem(remaining, two);
+        if bit == 1_u256 {
+            let (sum_inf, sum_x, sum_y) = point_add(
+                result_inf, result_x, result_y, addend_inf, addend_x, addend_y,
+            );
+            result_inf = sum_inf;
+            result_x = sum_x;
+            result_y = sum_y;
+        }
+
+        let (double_inf, double_x, double_y) = point_double(addend_inf, addend_x, addend_y);
+        addend_inf = double_inf;
+        addend_x = double_x;
+        addend_y = double_y;
+        remaining = next_remaining;
+        i += 1;
+    }
+
+    (result_inf, result_x, result_y)
+}
 
 /// Compute the Pedersen balance commitment E(balance, blinding).
 ///
 /// Returns the commitment as an (x, y) pair.
 /// Panics if the resulting point is the point at infinity.
 pub fn compute_commitment(balance: felt252, blinding: felt252) -> (felt252, felt252) {
-    // Recover generator points from their exact affine coordinates.
-    let g_nz: NonZeroEcPoint = EcPointTrait::new_nz(G_BALANCE_X, G_BALANCE_Y)
-        .expect('G_BALANCE not on curve');
-    let h_nz: NonZeroEcPoint = EcPointTrait::new_nz(H_BLIND_X, H_BLIND_Y)
-        .expect('H_BLIND not on curve');
-
-    // E = balance * G_balance + blinding * H_blind
-    let mut state = EcStateTrait::init();
-    state.add_mul(balance, g_nz);
-    state.add_mul(blinding, h_nz);
-
-    let result_nz = state.finalize_nz().expect('commitment is point at infinity');
-    result_nz.coordinates()
+    let (g_inf, g_x, g_y) = scalar_mul(G_BALANCE_X, G_BALANCE_Y, balance);
+    let (h_inf, h_x, h_y) = scalar_mul(H_BLIND_X, H_BLIND_Y, blinding);
+    let (result_inf, result_x, result_y) = point_add(g_inf, g_x, g_y, h_inf, h_x, h_y);
+    assert(!result_inf, 'commitment is infinity');
+    (result_x, result_y)
 }
 
 /// Verify that the given point (px, py) equals the commitment
@@ -62,11 +133,11 @@ mod tests {
     fn test_commitment_matches_rust_vector() {
         let (x, y) = compute_commitment(1000, 42);
         assert(
-            x == 0x5d1a6479b89911d4ad8a2317997bc93bb94377bedcb7c40314883883892d3c,
+            x == 0x77bd464e41fd97fc8eb7b2cf070fc6f3d7587707446b027e0c6b60a29a05eae,
             'unexpected commitment x',
         );
         assert(
-            y == 0x649e8a7082e97e3a54c406eb864111a867137884873d04b1ba6d2526508bfa0,
+            y == 0x23fd385119e903dd48d501552b1fb84e6e61a4685fe4d7ee4a6b71063a05611,
             'unexpected commitment y',
         );
     }

@@ -16,6 +16,12 @@ interface IFactRegistry {
 ///         pinned Cairo program hash, then asserts the fact exists in the
 ///         registry.
 contract FactRegistryAdapter is IZkApiProofAdapter {
+    uint256 internal constant STARK_FIELD_PRIME =
+        0x0800000000000011000000000000000000000000000000000000000000000001;
+
+    bytes internal constant REQUEST_OUTPUT_DOMAIN = "zkapi.req.outputs.v1";
+    bytes internal constant WITHDRAWAL_OUTPUT_DOMAIN = "zkapi.wd.outputs.v1";
+
     /// @notice The fact registry contract.
     IFactRegistry public immutable factRegistry;
 
@@ -68,44 +74,60 @@ contract FactRegistryAdapter is IZkApiProofAdapter {
     /// @dev Reconstruct the output hash for a request proof from its public inputs.
     ///      The fields are encoded in the same order as the Cairo program emits them.
     function _hashRequestOutputs(Types.RequestPublicInputs calldata inputs) internal pure returns (bytes32) {
-        return keccak256(
+        return _hashToFelt(
+            REQUEST_OUTPUT_DOMAIN,
             abi.encodePacked(
-                inputs.statementType,
-                inputs.protocolVersion,
-                inputs.chainId,
-                inputs.contractAddress,
-                inputs.activeRoot,
-                inputs.stateSigEpoch,
-                inputs.stateSigRoot,
-                inputs.requestNullifier,
-                inputs.anonCommitmentX,
-                inputs.anonCommitmentY,
-                inputs.expiryTs,
-                inputs.solvencyBound
+                bytes32(uint256(inputs.statementType)),
+                bytes32(uint256(inputs.protocolVersion)),
+                bytes32(uint256(inputs.chainId)),
+                bytes32(uint256(uint160(inputs.contractAddress))),
+                bytes32(inputs.activeRoot),
+                bytes32(uint256(inputs.stateSigEpoch)),
+                bytes32(inputs.stateSigRoot),
+                bytes32(inputs.requestNullifier),
+                bytes32(inputs.anonCommitmentX),
+                bytes32(inputs.anonCommitmentY),
+                bytes32(uint256(inputs.expiryTs)),
+                bytes32(uint256(inputs.solvencyBound))
             )
         );
     }
 
     /// @dev Reconstruct the output hash for a withdrawal proof from its public inputs.
     function _hashWithdrawalOutputs(Types.WithdrawalPublicInputs calldata inputs) internal pure returns (bytes32) {
-        return keccak256(
+        return _hashToFelt(
+            WITHDRAWAL_OUTPUT_DOMAIN,
             abi.encodePacked(
-                inputs.statementType,
-                inputs.protocolVersion,
-                inputs.chainId,
-                inputs.contractAddress,
-                inputs.activeRoot,
-                inputs.noteId,
-                inputs.finalBalance,
-                inputs.destination,
-                inputs.withdrawalNullifier,
-                inputs.isGenesis,
-                inputs.hasClearance,
-                inputs.stateSigEpoch,
-                inputs.stateSigRoot,
-                inputs.clearSigEpoch,
-                inputs.clearSigRoot
+                bytes32(uint256(inputs.statementType)),
+                bytes32(uint256(inputs.protocolVersion)),
+                bytes32(uint256(inputs.chainId)),
+                bytes32(uint256(uint160(inputs.contractAddress))),
+                bytes32(inputs.activeRoot),
+                bytes32(uint256(inputs.noteId)),
+                bytes32(uint256(inputs.finalBalance)),
+                bytes32(uint256(uint160(inputs.destination))),
+                bytes32(inputs.withdrawalNullifier),
+                bytes32(inputs.isGenesis ? uint256(1) : uint256(0)),
+                bytes32(inputs.hasClearance ? uint256(1) : uint256(0)),
+                bytes32(uint256(inputs.stateSigEpoch)),
+                bytes32(inputs.stateSigRoot),
+                bytes32(uint256(inputs.clearSigEpoch)),
+                bytes32(inputs.clearSigRoot)
             )
         );
+    }
+
+    function _hashToFelt(bytes memory domain, bytes memory payload) internal pure returns (bytes32) {
+        uint32 counter = 0;
+        while (true) {
+            bytes32 digest = keccak256(abi.encodePacked(domain, uint64(payload.length), payload, counter));
+            if (uint256(digest) < STARK_FIELD_PRIME) {
+                return digest;
+            }
+            unchecked {
+                counter += 1;
+            }
+        }
+        revert Errors.InvalidProof();
     }
 }

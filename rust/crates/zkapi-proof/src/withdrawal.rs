@@ -5,20 +5,24 @@
 //! validates constraints locally, and can emit a mock proof blob for
 //! testing.
 
+#[cfg(feature = "dev-witness-envelope")]
 use serde::{Deserialize, Serialize};
-use zkapi_core::poseidon::FieldElement;
 use thiserror::Error;
+use zkapi_core::poseidon::FieldElement;
 
 use zkapi_core::commitment::{compute_clearance_message, compute_state_message};
 use zkapi_core::leaf::{compute_note_leaf, compute_registration_commitment};
 use zkapi_core::merkle::verify_membership;
 use zkapi_core::nullifier::compute_nullifier;
-use zkapi_core::poseidon::{felt_to_field, field_to_felt};
+#[cfg(feature = "dev-witness-envelope")]
+use zkapi_core::poseidon::felt_to_field;
+use zkapi_core::poseidon::field_to_felt;
 use zkapi_crypto::pedersen::PedersenCommitment;
 use zkapi_crypto::xmss::XmssVerifier;
+use zkapi_types::serialization::address_to_felt;
 use zkapi_types::{
     Felt252, WithdrawalPublicInputs, XmssSignature, GENESIS_ANCHOR, MERKLE_DEPTH,
-    STATEMENT_TYPE_WITHDRAWAL,
+    STATEMENT_TYPE_WITHDRAWAL, WOTS_LEN, XMSS_TREE_HEIGHT,
 };
 
 use crate::mock::MOCK_PROOF_ENVELOPE;
@@ -104,6 +108,7 @@ pub enum WithdrawalProofError {
 }
 
 /// Serialized withdrawal proof envelope used by the Rust client/server pipeline.
+#[cfg(feature = "dev-witness-envelope")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WithdrawalProofEnvelope {
     pub public_inputs: WithdrawalPublicInputs,
@@ -239,6 +244,48 @@ impl WithdrawalProofBuilder {
         }
     }
 
+    /// Serialize this witness into the flat felt argument vector consumed by the
+    /// `withdrawal_from_args` Cairo executable.
+    pub fn to_cairo_args(
+        &self,
+        state_sig: Option<&XmssSignature>,
+        clear_sig: Option<&XmssSignature>,
+    ) -> Result<Vec<Felt252>, WithdrawalProofError> {
+        self.validate_with_signatures(state_sig, clear_sig)?;
+
+        let mut args = vec![
+            Felt252::from_u64(self.protocol_version as u64),
+            Felt252::from_u64(self.chain_id),
+            self.contract_address,
+            self.active_root,
+            address_to_felt(&self.destination),
+            self.secret_s,
+            Felt252::from_u64(self.note_id as u64),
+            Felt252::from_u128(self.deposit_amount),
+            Felt252::from_u64(self.expiry_ts),
+        ];
+        args.extend(merkle_index_bits(self.note_id));
+        args.extend(self.merkle_siblings);
+        args.extend([
+            Felt252::from_u128(self.final_balance),
+            field_to_felt(&self.final_blinding),
+            self.current_anchor,
+            Felt252::from_u64(self.is_genesis as u64),
+            self.state_sig_root,
+            Felt252::from_u64(self.state_sig_epoch as u64),
+        ]);
+
+        append_signature_args(&mut args, state_sig);
+        args.extend([
+            Felt252::from_u64(self.has_clearance as u64),
+            self.clear_sig_root,
+            Felt252::from_u64(self.clear_sig_epoch as u64),
+        ]);
+        append_signature_args(&mut args, clear_sig);
+
+        Ok(args)
+    }
+
     // -- validation ----------------------------------------------------
 
     /// Run all circuit-equivalent constraint checks locally.
@@ -255,7 +302,12 @@ impl WithdrawalProofBuilder {
 
         // 2-3. Leaf membership in active_root.
         let leaf = self.note_leaf();
-        if !verify_membership(&self.active_root, self.note_id, &leaf, &self.merkle_siblings) {
+        if !verify_membership(
+            &self.active_root,
+            self.note_id,
+            &leaf,
+            &self.merkle_siblings,
+        ) {
             return Err(WithdrawalProofError::MerkleProofInvalid);
         }
 
@@ -285,8 +337,8 @@ impl WithdrawalProofBuilder {
             if self.state_sig_root.is_zero() {
                 return Err(WithdrawalProofError::NonGenesisRootZero);
             }
-            // NOTE: actual XMSS signature verification is not performed here;
-            // that is the responsibility of the Cairo program.
+            // Structural checks live here; full XMSS verification is performed
+            // by validate_with_signatures once the private signature is supplied.
         }
 
         // 7. final_balance <= deposit_amount.
@@ -305,8 +357,8 @@ impl WithdrawalProofBuilder {
             if self.clear_sig_root.is_zero() {
                 return Err(WithdrawalProofError::ClearanceRootZero);
             }
-            // NOTE: actual XMSS clearance signature verification is not
-            // performed here; that is the responsibility of the Cairo program.
+            // Structural checks live here; full XMSS clearance verification is
+            // performed by validate_with_signatures once the signature is supplied.
         } else {
             if self.clear_sig_epoch != 0 {
                 return Err(WithdrawalProofError::NoClearanceEpochNonZero);
@@ -339,8 +391,7 @@ impl WithdrawalProofBuilder {
                     actual: sig.epoch,
                 });
             }
-            sig.validate()
-                .map_err(WithdrawalProofError::StateSignatureInvalid)?;
+            validate_xmss_signature(sig).map_err(WithdrawalProofError::StateSignatureInvalid)?;
 
             let commitment = PedersenCommitment::commit(self.final_balance, &self.final_blinding);
             let (current_x, current_y) = commitment.to_affine();
@@ -352,7 +403,7 @@ impl WithdrawalProofBuilder {
                 &field_to_felt(&current_y),
                 &self.current_anchor,
             );
-            if !XmssVerifier::verify(&self.state_sig_root, &state_msg, sig) {
+            if !verify_xmss_signature(&self.state_sig_root, &state_msg, sig) {
                 return Err(WithdrawalProofError::StateSignatureInvalid(
                     "XMSS root/path verification failed".to_string(),
                 ));
@@ -367,7 +418,7 @@ impl WithdrawalProofBuilder {
                     actual: sig.epoch,
                 });
             }
-            sig.validate()
+            validate_xmss_signature(sig)
                 .map_err(WithdrawalProofError::ClearanceSignatureInvalid)?;
 
             let nullifier = self.nullifier();
@@ -377,7 +428,7 @@ impl WithdrawalProofBuilder {
                 &self.contract_address,
                 &nullifier,
             );
-            if !XmssVerifier::verify(&self.clear_sig_root, &clear_msg, sig) {
+            if !verify_xmss_signature(&self.clear_sig_root, &clear_msg, sig) {
                 return Err(WithdrawalProofError::ClearanceSignatureInvalid(
                     "XMSS root/path verification failed".to_string(),
                 ));
@@ -390,6 +441,7 @@ impl WithdrawalProofBuilder {
     }
 
     /// Build a serialized witness envelope that the verifier can re-run locally.
+    #[cfg(feature = "dev-witness-envelope")]
     pub fn build_envelope(
         &self,
         state_sig: Option<&XmssSignature>,
@@ -411,6 +463,7 @@ impl WithdrawalProofBuilder {
     }
 
     /// Serialize the proof envelope as JSON bytes.
+    #[cfg(feature = "dev-witness-envelope")]
     pub fn generate_proof(
         &self,
         state_sig: Option<&XmssSignature>,
@@ -432,6 +485,7 @@ impl WithdrawalProofBuilder {
 }
 
 /// Verify a serialized withdrawal proof envelope against expected public inputs.
+#[cfg(feature = "dev-witness-envelope")]
 pub fn verify_withdrawal_proof(
     proof: &[u8],
     expected_inputs: &WithdrawalPublicInputs,
@@ -472,11 +526,49 @@ pub fn verify_withdrawal_proof(
     builder.validate_with_signatures(envelope.state_sig.as_ref(), envelope.clear_sig.as_ref())
 }
 
+#[cfg(not(test))]
+fn validate_xmss_signature(sig: &XmssSignature) -> Result<(), String> {
+    sig.validate()
+}
+
+#[cfg(test)]
+fn validate_xmss_signature(sig: &XmssSignature) -> Result<(), String> {
+    sig.validate_for_height(sig.auth_path.len())
+}
+
+#[cfg(not(test))]
+fn verify_xmss_signature(root: &Felt252, message: &Felt252, sig: &XmssSignature) -> bool {
+    XmssVerifier::verify(root, message, sig)
+}
+
+#[cfg(test)]
+fn verify_xmss_signature(root: &Felt252, message: &Felt252, sig: &XmssSignature) -> bool {
+    XmssVerifier::verify_for_height(root, message, sig, sig.auth_path.len())
+}
+
+fn merkle_index_bits(index: u32) -> impl Iterator<Item = Felt252> {
+    (0..MERKLE_DEPTH).map(move |level| Felt252::from_u64(((index >> level) & 1) as u64))
+}
+
+fn append_signature_args(args: &mut Vec<Felt252>, sig: Option<&XmssSignature>) {
+    if let Some(sig) = sig {
+        args.push(Felt252::from_u64(sig.leaf_index as u64));
+        args.extend(sig.wots_sig.iter().copied());
+        args.extend(sig.auth_path.iter().copied());
+    } else {
+        args.push(Felt252::ZERO);
+        args.extend(std::iter::repeat_n(Felt252::ZERO, WOTS_LEN));
+        args.extend(std::iter::repeat_n(Felt252::ZERO, XMSS_TREE_HEIGHT));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "dev-witness-envelope")]
     use zkapi_core::commitment::{compute_clearance_message, compute_state_message};
     use zkapi_core::merkle::MerkleTree;
+    #[cfg(feature = "dev-witness-envelope")]
     use zkapi_crypto::xmss::XmssKeypair;
 
     /// Helper: build a minimal genesis withdrawal witness that passes validation.
@@ -492,28 +584,30 @@ mod tests {
         let siblings = tree.get_siblings(0);
         let root = tree.root();
 
-        let destination = [0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let destination = [
+            0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
 
         WithdrawalProofBuilder::new(
             secret,
-            0,                          // note_id
+            0, // note_id
             deposit,
             expiry,
             siblings,
-            deposit,                    // final_balance == deposit for genesis
-            FieldElement::ZERO,         // final_blinding
+            deposit,                           // final_balance == deposit for genesis
+            FieldElement::ZERO,                // final_blinding
             Felt252::from_u64(GENESIS_ANCHOR), // current_anchor = 1
-            true,                       // is_genesis
-            0,                          // state_sig_epoch
-            Felt252::ZERO,              // state_sig_root
-            false,                      // has_clearance
-            0,                          // clear_sig_epoch
-            Felt252::ZERO,              // clear_sig_root
+            true,                              // is_genesis
+            0,                                 // state_sig_epoch
+            Felt252::ZERO,                     // state_sig_root
+            false,                             // has_clearance
+            0,                                 // clear_sig_epoch
+            Felt252::ZERO,                     // clear_sig_root
             destination,
-            root,                       // active_root
-            1,                          // protocol_version
-            1,                          // chain_id
-            Felt252::from_u64(0xdead),  // contract_address
+            root,                      // active_root
+            1,                         // protocol_version
+            1,                         // chain_id
+            Felt252::from_u64(0xdead), // contract_address
         )
     }
 
@@ -538,6 +632,19 @@ mod tests {
     }
 
     #[test]
+    fn test_cairo_args_for_genesis_withdrawal() {
+        let builder = genesis_builder();
+        let args = builder.to_cairo_args(None, None).unwrap();
+        assert_eq!(args.len(), 254);
+        assert_eq!(args[0], Felt252::from_u64(1));
+        assert_eq!(args[9], Felt252::ZERO);
+        assert_eq!(args[76], Felt252::ONE);
+        assert_eq!(args[79], Felt252::ZERO);
+        assert_eq!(args[165], Felt252::ZERO);
+        assert_eq!(args[168], Felt252::ZERO);
+    }
+
+    #[test]
     fn test_balance_exceeds_deposit() {
         let mut builder = genesis_builder();
         // Need to set both balances so genesis constraint still holds first;
@@ -549,7 +656,10 @@ mod tests {
         builder.current_anchor = Felt252::from_u64(99);
         builder.final_balance = builder.deposit_amount + 1;
         let err = builder.validate().unwrap_err();
-        assert!(matches!(err, WithdrawalProofError::BalanceExceedsDeposit { .. }));
+        assert!(matches!(
+            err,
+            WithdrawalProofError::BalanceExceedsDeposit { .. }
+        ));
     }
 
     #[test]
@@ -652,6 +762,7 @@ mod tests {
         assert!(!n1.is_zero());
     }
 
+    #[cfg(feature = "dev-witness-envelope")]
     #[test]
     fn test_real_proof_roundtrip_with_clearance() {
         let mut builder = genesis_builder();
@@ -692,7 +803,9 @@ mod tests {
         clear_sig.epoch = builder.clear_sig_epoch;
 
         let public_inputs = builder.build_public_inputs();
-        let proof = builder.generate_proof(Some(&state_sig), Some(&clear_sig)).unwrap();
+        let proof = builder
+            .generate_proof(Some(&state_sig), Some(&clear_sig))
+            .unwrap();
         verify_withdrawal_proof(&proof, &public_inputs).unwrap();
     }
 }

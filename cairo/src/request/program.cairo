@@ -153,6 +153,7 @@ pub fn run_request_program(
 #[cfg(test)]
 mod tests {
     use core::poseidon::poseidon_hash_span;
+    use zkapi_cairo::constants::MERKLE_DEPTH;
     use zkapi_cairo::domains::{DOMAIN_LEAF, DOMAIN_NODE, DOMAIN_REG};
     use super::run_request_program;
 
@@ -162,7 +163,7 @@ mod tests {
         let mut zero = 0;
         let mut current = leaf;
         let mut i: u32 = 0;
-        while i < 32 {
+        while i < MERKLE_DEPTH {
             index_bits.append(0);
             siblings.append(zero);
             current = poseidon_hash_span(array![DOMAIN_NODE, current, zero].span());

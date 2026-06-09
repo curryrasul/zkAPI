@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use zkapi_core::poseidon::{felt_to_field, field_to_felt};
-use zkapi_types::domain::{DOMAIN_XMSS_MSG, DOMAIN_XMSS_NODE};
+use zkapi_types::domain::{DOMAIN_XMSS_MSG, DOMAIN_XMSS_NODE, DOMAIN_XMSS_SK};
 use zkapi_types::{Felt252, XmssSignature, WOTS_LEN, XMSS_TREE_HEIGHT};
 
 use crate::wots::{wots_keygen, wots_pk_to_leaf, wots_sign, wots_verify};
@@ -64,6 +64,7 @@ impl XmssKeypair {
             let mut sk = [FieldElement::ZERO; WOTS_LEN];
             for (j, item) in sk.iter_mut().enumerate().take(WOTS_LEN) {
                 *item = poseidon_hash_many(&[
+                    felt_to_field(&DOMAIN_XMSS_SK),
                     *seed,
                     FieldElement::from(i as u64),
                     FieldElement::from(j as u64),
@@ -116,14 +117,25 @@ impl XmssKeypair {
     ///
     /// Returns None if the tree is exhausted.
     pub fn sign(&self, message: &Felt252) -> Option<(XmssSignature, u32)> {
+        self.sign_with_index(|_| *message)
+            .map(|(sig, index, _message)| (sig, index))
+    }
+
+    /// Reserve the next leaf under the signer lock, build the message from
+    /// that exact leaf index, and sign it.
+    pub fn sign_with_index<F>(&self, build_message: F) -> Option<(XmssSignature, u32, Felt252)>
+    where
+        F: FnOnce(u32) -> Felt252,
+    {
         let _lock = self.sign_lock.lock().unwrap();
         let idx = self.next_index.load(Ordering::SeqCst);
         if idx >= (1 << self.height) {
             return None; // Tree exhausted
         }
+        let message = build_message(idx);
         self.next_index.store(idx + 1, Ordering::SeqCst);
 
-        let msg_hash = xmss_hash_message(message);
+        let msg_hash = xmss_hash_message(&message);
 
         // WOTS+ sign
         let wots_sig = wots_sign(&self.secret_keys[idx as usize], &msg_hash);
@@ -144,13 +156,53 @@ impl XmssKeypair {
             auth_path,
         };
 
-        Some((sig, idx))
+        Some((sig, idx, message))
+    }
+
+    /// Sign a message using an externally reserved leaf index.
+    ///
+    /// This is used by durable signers that reserve/burn the leaf in persistent
+    /// storage before constructing the message. The in-memory cursor is advanced
+    /// past the reserved index so non-durable peeks remain conservative.
+    pub fn sign_reserved(&self, index: u32, message: &Felt252) -> Option<XmssSignature> {
+        let _lock = self.sign_lock.lock().unwrap();
+        if index >= (1 << self.height) {
+            return None;
+        }
+        let next = index.checked_add(1)?;
+        let current = self.next_index.load(Ordering::SeqCst);
+        if current < next {
+            self.next_index.store(next, Ordering::SeqCst);
+        }
+
+        let msg_hash = xmss_hash_message(message);
+        let wots_sig = wots_sign(&self.secret_keys[index as usize], &msg_hash);
+
+        let mut auth_path = Vec::with_capacity(self.height);
+        let mut node_idx = index;
+        for level in 0..self.height {
+            let sibling_idx = node_idx ^ 1;
+            auth_path.push(field_to_felt(&self.tree[level][sibling_idx as usize]));
+            node_idx /= 2;
+        }
+
+        Some(XmssSignature {
+            epoch: 0,
+            leaf_index: index,
+            wots_sig: wots_sig.iter().map(field_to_felt).collect(),
+            auth_path,
+        })
     }
 
     /// Get the number of remaining signatures.
     pub fn remaining(&self) -> u32 {
         let used = self.next_index.load(Ordering::SeqCst);
-        (1u32 << self.height) - used
+        self.capacity() - used
+    }
+
+    /// Total number of leaves in this XMSS tree.
+    pub fn capacity(&self) -> u32 {
+        1u32 << self.height
     }
 
     /// Peek the next unused leaf index without consuming it.
@@ -169,20 +221,30 @@ pub struct XmssVerifier;
 
 impl XmssVerifier {
     /// Verify an XMSS signature against a known root.
-    pub fn verify(
-        root: &Felt252,
-        message: &Felt252,
-        sig: &XmssSignature,
-    ) -> bool {
+    pub fn verify(root: &Felt252, message: &Felt252, sig: &XmssSignature) -> bool {
         if sig.validate().is_err() {
             return false;
         }
+        Self::verify_inner(root, message, sig)
+    }
 
+    pub fn verify_for_height(
+        root: &Felt252,
+        message: &Felt252,
+        sig: &XmssSignature,
+        height: usize,
+    ) -> bool {
+        if sig.validate_for_height(height).is_err() {
+            return false;
+        }
+        Self::verify_inner(root, message, sig)
+    }
+
+    fn verify_inner(root: &Felt252, message: &Felt252, sig: &XmssSignature) -> bool {
         let msg_hash = xmss_hash_message(message);
 
         // Recover WOTS+ public key
-        let wots_sig_fields: Vec<FieldElement> =
-            sig.wots_sig.iter().map(felt_to_field).collect();
+        let wots_sig_fields: Vec<FieldElement> = sig.wots_sig.iter().map(felt_to_field).collect();
         let mut wots_sig_arr = [FieldElement::ZERO; WOTS_LEN];
         wots_sig_arr.copy_from_slice(&wots_sig_fields);
 
@@ -232,7 +294,12 @@ mod tests {
         assert_eq!(idx, 0);
 
         let root = keypair.root_felt();
-        assert!(XmssVerifier::verify(&root, &message, &sig));
+        assert!(XmssVerifier::verify_for_height(
+            &root,
+            &message,
+            &sig,
+            TEST_HEIGHT
+        ));
     }
 
     #[test]
@@ -245,7 +312,12 @@ mod tests {
 
         let wrong_message = Felt252::from_u64(54321);
         let root = keypair.root_felt();
-        assert!(!XmssVerifier::verify(&root, &wrong_message, &sig));
+        assert!(!XmssVerifier::verify_for_height(
+            &root,
+            &wrong_message,
+            &sig,
+            TEST_HEIGHT
+        ));
     }
 
     #[test]
@@ -257,7 +329,12 @@ mod tests {
         sig.epoch = 1;
 
         let wrong_root = Felt252::from_u64(999);
-        assert!(!XmssVerifier::verify(&wrong_root, &message, &sig));
+        assert!(!XmssVerifier::verify_for_height(
+            &wrong_root,
+            &message,
+            &sig,
+            TEST_HEIGHT
+        ));
     }
 
     #[test]
@@ -270,7 +347,12 @@ mod tests {
             let (mut sig, idx) = keypair.sign(&msg).unwrap();
             sig.epoch = 1;
             assert_eq!(idx, i as u32);
-            assert!(XmssVerifier::verify(&root, &msg, &sig));
+            assert!(XmssVerifier::verify_for_height(
+                &root,
+                &msg,
+                &sig,
+                TEST_HEIGHT
+            ));
         }
     }
 }

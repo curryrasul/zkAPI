@@ -6,12 +6,12 @@
 //! It is required for homomorphic addition and rerandomization.
 //!
 //! G_balance and H_blind are fixed independent generators derived offline
-//! from the labels "zkapi.bal.g" and "zkapi.bal.h" using hash-to-curve.
+//! from the labels "zkapi.bal.g" and "zkapi.bal.h" using try-and-increment
+//! hash-to-curve.
 //! They are committed as protocol constants.
 
 use std::ops::Neg;
 
-use starknet_crypto::poseidon_hash_many;
 use starknet_types_core::curve::ProjectivePoint;
 use starknet_types_core::felt::Felt;
 
@@ -19,27 +19,22 @@ use starknet_types_core::felt::Felt;
 /// `FieldElement`.
 pub type FieldElement = Felt;
 
-/// The Stark curve generator point (standard).
-const STARK_GEN_X: &str = "01ef15c18599971b7beced415a40f0c7deacfd9b0d1819e03d723d8bc943cfca";
-const STARK_GEN_Y: &str = "005668060aa49730b7be4801df46ec62de53ecd11abe43a32873000c36e8dc1f";
+/// G_balance generator coordinates.
+///
+/// Reproducible derivation:
+/// `keccak256("zkapi.pedersen.h2c.v1" || "zkapi.bal.g" || counter_be32)`,
+/// try counters from zero, reduce digest to an x coordinate, and accept the
+/// first x whose Stark curve equation has a square root. The even y root is
+/// selected. For this label the accepted counter is 0.
+pub const G_BALANCE_X_HEX: &str =
+    "02e60e3230fe061dbebac8fd2cfa503e4eb92783aeb5fd6fb931a66ee277e4d3";
+pub const G_BALANCE_Y_HEX: &str =
+    "039289536a4fb4c04778f51eed313db47730cf86d342fd3f80f27bed1c2febac";
 
-/// G_balance: derived from hash-to-curve with label "zkapi.bal.g"
-/// For v1, we use a deterministic derivation: hash the label, multiply generator.
-/// In production, these would be derived by a trusted setup script.
-///
-/// We derive G_balance = scalar("zkapi.bal.g") * G
-/// and H_blind = scalar("zkapi.bal.h") * G
-/// where scalar(label) = Poseidon(domain_felt(label), 0, 0) mod order.
-///
-/// This ensures G_balance and H_blind are independent generators where
-/// the discrete log relationship is unknown.
-fn derive_generator(label_hash: &Felt) -> ProjectivePoint {
-    let gen_x = Felt::from_hex_unchecked(STARK_GEN_X);
-    let gen_y = Felt::from_hex_unchecked(STARK_GEN_Y);
-    let gen = ProjectivePoint::from_affine(gen_x, gen_y).unwrap();
-    // Scalar multiplication
-    scalar_mul(&gen, label_hash)
-}
+/// H_blind generator coordinates, derived with the same procedure from
+/// "zkapi.bal.h". The accepted counter is 0.
+pub const H_BLIND_X_HEX: &str = "009ed31288dc3e29f8759144b455aa05f39eee1a947e92fc1a9d71d15ed49faa";
+pub const H_BLIND_Y_HEX: &str = "073853a56a47d4dbeaf5c18ca78fbf64f414d5fccefaac0227d5c2654d2ca9b4";
 
 fn scalar_mul(point: &ProjectivePoint, scalar: &Felt) -> ProjectivePoint {
     let bits = scalar.to_bits_le();
@@ -57,36 +52,19 @@ fn scalar_mul(point: &ProjectivePoint, scalar: &Felt) -> ProjectivePoint {
 lazy_static::lazy_static! {
     /// G_balance generator point.
     pub static ref G_BALANCE: ProjectivePoint = {
-        // Use from_bytes_be with a 32-byte array for the label.
-        let label_felt = felt_from_label(b"zkapi.bal.g");
-        let hash = poseidon_hash_many(&[
-            label_felt,
-            Felt::ZERO,
-            Felt::ZERO,
-        ]);
-        derive_generator(&hash)
+        ProjectivePoint::from_affine(
+            Felt::from_hex_unchecked(G_BALANCE_X_HEX),
+            Felt::from_hex_unchecked(G_BALANCE_Y_HEX),
+        ).expect("G_BALANCE constant must be on curve")
     };
 
     /// H_blind generator point.
     pub static ref H_BLIND: ProjectivePoint = {
-        let label_felt = felt_from_label(b"zkapi.bal.h");
-        let hash = poseidon_hash_many(&[
-            label_felt,
-            Felt::ZERO,
-            Felt::ZERO,
-        ]);
-        derive_generator(&hash)
+        ProjectivePoint::from_affine(
+            Felt::from_hex_unchecked(H_BLIND_X_HEX),
+            Felt::from_hex_unchecked(H_BLIND_Y_HEX),
+        ).expect("H_BLIND constant must be on curve")
     };
-}
-
-/// Convert a label byte slice (up to 31 bytes) into a Felt by zero-padding
-/// on the left to 32 bytes.
-fn felt_from_label(label: &[u8]) -> Felt {
-    assert!(label.len() <= 31, "label must be <= 31 bytes");
-    let mut bytes = [0u8; 32];
-    let offset = 32 - label.len();
-    bytes[offset..].copy_from_slice(label);
-    Felt::from_bytes_be(&bytes)
 }
 
 /// A Pedersen commitment E(B, r) = B * G_balance + r * H_blind.
@@ -101,9 +79,7 @@ impl PedersenCommitment {
         let b_scalar = Felt::from(balance);
         let bg = scalar_mul(&G_BALANCE, &b_scalar);
         let rh = scalar_mul(&H_BLIND, blinding);
-        Self {
-            point: &bg + &rh,
-        }
+        Self { point: &bg + &rh }
     }
 
     /// Rerandomize: E(B, r + rho) = E(B, r) + rho * H_blind.
@@ -143,11 +119,7 @@ impl PedersenCommitment {
     }
 
     /// Verify that a commitment opens to the given values.
-    pub fn verify_opening(
-        &self,
-        balance: u128,
-        blinding: &Felt,
-    ) -> bool {
+    pub fn verify_opening(&self, balance: u128, blinding: &Felt) -> bool {
         let expected = Self::commit(balance, blinding);
         self.point == expected.point
     }
@@ -171,12 +143,75 @@ mod tests {
     }
 
     #[test]
+    fn test_generators_match_committed_constants() {
+        let g = G_BALANCE.to_affine().unwrap();
+        let h = H_BLIND.to_affine().unwrap();
+        assert_eq!(g.x(), Felt::from_hex_unchecked(G_BALANCE_X_HEX));
+        assert_eq!(g.y(), Felt::from_hex_unchecked(G_BALANCE_Y_HEX));
+        assert_eq!(h.x(), Felt::from_hex_unchecked(H_BLIND_X_HEX));
+        assert_eq!(h.y(), Felt::from_hex_unchecked(H_BLIND_Y_HEX));
+    }
+
+    #[test]
+    fn old_scalar_multiple_derivation_allows_reopening() {
+        let public_a = Felt::from(11u64);
+        let public_b = Felt::ONE;
+        let old_g = scalar_mul(&G_BALANCE, &public_a);
+        let old_h = scalar_mul(&G_BALANCE, &public_b);
+
+        let balance = 1_000u64;
+        let blinding = Felt::from(42u64);
+        let commitment = &scalar_mul(&old_g, &Felt::from(balance)) + &scalar_mul(&old_h, &blinding);
+
+        let forged_balance = 999u64;
+        let forged_blinding = blinding + (Felt::from(balance - forged_balance) * public_a);
+        let forged = &scalar_mul(&old_g, &Felt::from(forged_balance))
+            + &scalar_mul(&old_h, &forged_blinding);
+
+        assert_eq!(commitment, forged);
+    }
+
+    #[test]
     fn test_commit_and_verify() {
         let balance = 1000u128;
         let blinding = Felt::from(42u64);
         let c = PedersenCommitment::commit(balance, &blinding);
+        let (x, y) = c.to_affine();
+        assert_eq!(
+            x,
+            Felt::from_hex_unchecked(
+                "077bd464e41fd97fc8eb7b2cf070fc6f3d7587707446b027e0c6b60a29a05eae"
+            )
+        );
+        assert_eq!(
+            y,
+            Felt::from_hex_unchecked(
+                "023fd385119e903dd48d501552b1fb84e6e61a4685fe4d7ee4a6b71063a05611"
+            )
+        );
         assert!(c.verify_opening(balance, &blinding));
         assert!(!c.verify_opening(999, &blinding));
+    }
+
+    #[test]
+    fn test_negative_openings_for_distinct_values() {
+        let cases = [
+            (0u128, 1u64, 1u128, 1u64),
+            (1u128, 2u64, 2u128, 2u64),
+            (100u128, 42u64, 99u128, 42u64),
+            (u64::MAX as u128, 123u64, u64::MAX as u128, 124u64),
+            (
+                u128::from(u64::MAX) + 7,
+                99u64,
+                u128::from(u64::MAX) + 8,
+                99u64,
+            ),
+        ];
+
+        for (balance, blinding, wrong_balance, wrong_blinding) in cases {
+            let commitment = PedersenCommitment::commit(balance, &Felt::from(blinding));
+            assert!(!commitment.verify_opening(wrong_balance, &Felt::from(wrong_blinding)));
+        }
     }
 
     #[test]

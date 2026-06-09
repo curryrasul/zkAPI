@@ -1,6 +1,19 @@
 //! Client configuration.
 
-use zkapi_types::Felt252;
+use zkapi_types::{EpochRoots, Felt252};
+
+/// Proof backend used by the wallet when building request/withdrawal proofs.
+#[derive(Debug, Clone)]
+pub enum ClientProofMode {
+    /// Generate real Stwo/Stwo-Cairo proof artifacts through Scarb.
+    StwoScarb {
+        /// Path to the Cairo package directory.
+        cairo_dir: String,
+    },
+    /// Development-only local witness envelope.
+    #[cfg(feature = "dev-witness-envelope")]
+    DevWitnessEnvelope,
+}
 
 /// Configuration for the client SDK, matching the deployed contract parameters.
 pub struct ClientConfig {
@@ -20,4 +33,8 @@ pub struct ClientConfig {
     pub server_url: String,
     /// Directory for persisting wallet state and journals.
     pub state_dir: String,
+    /// Trusted server signing roots published by the epoch registry.
+    pub trusted_epoch_roots: Vec<EpochRoots>,
+    /// Proof backend used for runtime proof generation.
+    pub proof_mode: ClientProofMode,
 }

@@ -21,21 +21,24 @@ use zkapi_types::wire::{
 use zkapi_types::Felt252;
 
 use crate::error::ServerError;
-use crate::provider::EchoProvider;
 use crate::processor::RequestProcessor;
+use crate::provider::EchoProvider;
 
 /// Shared application state.
 type AppState = Arc<RequestProcessor>;
 
 /// Start the HTTP server with the given config.
 pub async fn run_server(config: crate::config::ServerConfig) -> anyhow::Result<()> {
-    let store = Arc::new(crate::nullifier_store::NullifierStore::new(&config.db_path)?);
-    let signer = Arc::new(crate::signer::ServerSigner::with_height(
+    let store = Arc::new(crate::nullifier_store::NullifierStore::new(
+        &config.db_path,
+    )?);
+    let signer = Arc::new(crate::signer::ServerSigner::with_height_durable(
         felt_to_field(&config.state_seed),
         felt_to_field(&config.clear_seed),
         config.epoch,
         config.xmss_height,
-    ));
+        &config.db_path,
+    )?);
     let provider = Arc::new(EchoProvider::default());
     let processor = Arc::new(RequestProcessor::new(
         config.clone(),
@@ -56,8 +59,14 @@ pub fn create_router(processor: Arc<RequestProcessor>) -> Router {
     Router::new()
         .route("/v1/requests", post(handle_request))
         .route("/v1/withdraw/clearance", post(handle_clearance))
-        .route("/v1/requests/{client_request_id}", get(handle_recovery_by_id))
-        .route("/v1/nullifiers/{nullifier}", get(handle_recovery_by_nullifier))
+        .route(
+            "/v1/requests/{client_request_id}",
+            get(handle_recovery_by_id),
+        )
+        .route(
+            "/v1/nullifiers/{nullifier}",
+            get(handle_recovery_by_nullifier),
+        )
         .with_state(processor)
 }
 
@@ -81,11 +90,7 @@ async fn handle_clearance(
         .process_clearance(&clearance_req)
         .map(Json)
         .map_err(|e| {
-            error_to_response(
-                &e,
-                &clearance_req.withdrawal_nullifier.to_hex(),
-                &processor,
-            )
+            error_to_response(&e, &clearance_req.withdrawal_nullifier.to_hex(), &processor)
         })
 }
 
@@ -130,9 +135,7 @@ fn error_to_response(
         ServerError::Replay | ServerError::NullifierUsed => StatusCode::CONFLICT,
         ServerError::NoteExpired => StatusCode::GONE,
         ServerError::CapacityExhausted => StatusCode::SERVICE_UNAVAILABLE,
-        ServerError::Internal(_) | ServerError::Database(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        ServerError::Internal(_) | ServerError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
     let latest_root = if matches!(err, ServerError::StaleRoot { .. }) {

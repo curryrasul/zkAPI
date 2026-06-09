@@ -3,6 +3,8 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
+use crate::STARK_PRIME_HEX;
+
 /// A field element in the Stark prime field.
 ///
 /// Stored as 32 bytes big-endian. Must be < STARK_PRIME.
@@ -31,8 +33,16 @@ impl Felt252 {
         Self(bytes)
     }
 
-    /// Create from big-endian hex string (with or without 0x prefix).
-    pub fn from_hex(s: &str) -> Result<Self, String> {
+    /// Create from canonical big-endian bytes. Rejects values >= STARK_PRIME.
+    pub fn try_from_bytes_be(bytes: [u8; 32]) -> Result<Self, String> {
+        if bytes >= stark_prime_bytes() {
+            return Err("felt252 value must be < STARK_FIELD_PRIME".to_string());
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Create from big-endian hex string (with or without 0x prefix), checking field range.
+    pub fn from_hex_checked(s: &str) -> Result<Self, String> {
         let s = s.strip_prefix("0x").unwrap_or(s);
         let s = s.strip_prefix("0X").unwrap_or(s);
         if s.len() > 64 {
@@ -44,7 +54,12 @@ impl Felt252 {
             bytes[i] = u8::from_str_radix(&padded[i * 2..i * 2 + 2], 16)
                 .map_err(|e| format!("invalid hex: {}", e))?;
         }
-        Ok(Self(bytes))
+        Self::try_from_bytes_be(bytes)
+    }
+
+    /// Create from big-endian hex string (with or without 0x prefix).
+    pub fn from_hex(s: &str) -> Result<Self, String> {
+        Self::from_hex_checked(s)
     }
 
     /// Convert to 0x-prefixed lowercase hex string.
@@ -88,6 +103,20 @@ impl Felt252 {
         buf.copy_from_slice(&self.0[16..32]);
         Some(u128::from_be_bytes(buf))
     }
+}
+
+fn stark_prime_bytes() -> [u8; 32] {
+    let hex = STARK_PRIME_HEX
+        .strip_prefix("0x")
+        .unwrap_or(STARK_PRIME_HEX);
+    let mut bytes = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        bytes[i] =
+            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("STARK_PRIME_HEX is valid hex");
+        i += 1;
+    }
+    bytes
 }
 
 impl fmt::Debug for Felt252 {
@@ -151,5 +180,21 @@ mod tests {
         assert_eq!(json, "\"0xff\"");
         let back: Felt252 = serde_json::from_str(&json).unwrap();
         assert_eq!(f, back);
+    }
+
+    #[test]
+    fn test_rejects_noncanonical_prime_values() {
+        let prime = stark_prime_bytes();
+        assert!(Felt252::try_from_bytes_be(prime).is_err());
+
+        let mut prime_plus_one = prime;
+        for b in prime_plus_one.iter_mut().rev() {
+            let (next, overflow) = b.overflowing_add(1);
+            *b = next;
+            if !overflow {
+                break;
+            }
+        }
+        assert!(Felt252::try_from_bytes_be(prime_plus_one).is_err());
     }
 }

@@ -1,6 +1,19 @@
 //! Server configuration.
 
-use zkapi_types::Felt252;
+use zkapi_types::{EpochRoots, Felt252};
+
+/// Proof verifier backend used by the request processor.
+#[derive(Debug, Clone)]
+pub enum ServerProofMode {
+    /// Verify real Stwo/Stwo-Cairo proof artifacts through Scarb.
+    StwoScarb {
+        /// Path to the Cairo package directory.
+        cairo_dir: String,
+    },
+    /// Development-only local witness replay verifier.
+    #[cfg(feature = "dev-witness-envelope")]
+    DevWitnessEnvelope,
+}
 
 /// Configuration for the zkAPI server.
 #[derive(Debug, Clone)]
@@ -33,6 +46,10 @@ pub struct ServerConfig {
     pub xmss_height: usize,
     /// Initial Merkle root the server should accept until the indexer updates it.
     pub initial_root: Felt252,
+    /// Trusted epoch roots this server accepts for prior client states.
+    pub trusted_epoch_roots: Vec<EpochRoots>,
+    /// Proof backend used for runtime request verification.
+    pub proof_mode: ServerProofMode,
 }
 
 impl Default for ServerConfig {
@@ -52,6 +69,10 @@ impl Default for ServerConfig {
             epoch: 1,
             xmss_height: zkapi_types::XMSS_TREE_HEIGHT,
             initial_root: Felt252::ZERO,
+            trusted_epoch_roots: Vec::new(),
+            proof_mode: ServerProofMode::StwoScarb {
+                cairo_dir: "cairo".to_string(),
+            },
         }
     }
 }

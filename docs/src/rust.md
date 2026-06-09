@@ -20,20 +20,23 @@ Rust provides the operational state machines around the protocol.
 - WOTS+: [`rust/crates/zkapi-crypto/src/wots.rs`](../../rust/crates/zkapi-crypto/src/wots.rs)
 - XMSS: [`rust/crates/zkapi-crypto/src/xmss.rs`](../../rust/crates/zkapi-crypto/src/xmss.rs)
 
-## Proof Envelope Layer
+## Proof Artifact Layer
 
-The Rust client/server path now uses typed proof envelopes instead of a blind mock blob:
+The Rust client/server path now uses opaque proof artifacts by default:
 
-- request envelope and verifier: [`rust/crates/zkapi-proof/src/request.rs`](../../rust/crates/zkapi-proof/src/request.rs)
-- withdrawal envelope and verifier: [`rust/crates/zkapi-proof/src/withdrawal.rs`](../../rust/crates/zkapi-proof/src/withdrawal.rs)
+- request witness builder and Cairo args: [`rust/crates/zkapi-proof/src/request.rs`](../../rust/crates/zkapi-proof/src/request.rs)
+- withdrawal witness builder and Cairo args: [`rust/crates/zkapi-proof/src/withdrawal.rs`](../../rust/crates/zkapi-proof/src/withdrawal.rs)
+- Stwo/Scarb bridge: [`rust/crates/zkapi-proof/src/stwo.rs`](../../rust/crates/zkapi-proof/src/stwo.rs)
 
 What this means operationally:
 
-- the client serializes the full witness and signatures
-- the server decodes the envelope
-- the server recomputes the exact same constraints locally before serving work
+- the client serializes private witness data only into local Cairo executable arguments
+- Scarb proves and verifies the Cairo execution before the client sends a request
+- the wire request carries an opaque proof artifact plus canonical public-output hash
+- the server rejects mismatched public-output hashes and runs `scarb verify --proof-file`
 
-This is still separate from the production on-chain Cairo verifier path, but it eliminates the old off-chain “accept anything” hole.
+The old witness envelope/local replay path is available only behind the
+`dev-witness-envelope` feature for development tests.
 
 ## Client SDK
 
@@ -70,5 +73,5 @@ The previous fixed-seed/fixed-height server bootstrap has been removed in favor 
 That means the server persists enough material to answer a stale escape withdrawal with:
 
 - the original request public inputs
-- the archived proof envelope
+- the archived proof artifact
 - the note-specific restore siblings supplied by the indexer/chain watcher

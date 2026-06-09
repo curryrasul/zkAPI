@@ -4,16 +4,14 @@
 //! execution is application-specific, so the server uses a provider trait with
 //! a small deterministic implementation for local development/tests.
 
-use zkapi_types::Felt252;
-
 use crate::error::ServerError;
+use zkapi_types::Felt252;
 
 /// Result of executing the upstream API call.
 #[derive(Debug, Clone)]
 pub struct ProviderResponse {
     pub status_code: u16,
     pub payload: String,
-    pub response_hash: Felt252,
     pub charge_applied: u128,
     pub policy_reason_code: Option<u32>,
     pub policy_evidence_hash: Option<Felt252>,
@@ -55,12 +53,11 @@ impl ApiProvider for EchoProvider {
         &self,
         _client_request_id: &str,
         payload: &str,
-        payload_hash: &Felt252,
+        _payload_hash: &Felt252,
     ) -> Result<ProviderResponse, ServerError> {
         Ok(ProviderResponse {
             status_code: 200,
             payload: payload.to_string(),
-            response_hash: *payload_hash,
             charge_applied: self.fixed_charge,
             policy_reason_code: None,
             policy_evidence_hash: None,

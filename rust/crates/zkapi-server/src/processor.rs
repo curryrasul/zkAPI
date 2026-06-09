@@ -2,7 +2,7 @@
 //!
 //! Follows the server flow from spec section 9.3:
 //! 1. Validate public inputs against config
-//! 2. Verify the proof envelope and replay the witness locally
+//! 2. Verify the opaque proof artifact
 //! 3. Reserve nullifier
 //! 4. Execute provider call
 //! 5. Compute charge, anchor, blind delta, next commitment
@@ -17,14 +17,19 @@ use base64::Engine;
 use zkapi_core::commitment::{compute_blind_delta, compute_next_anchor, compute_state_message};
 use zkapi_core::poseidon::{felt_to_field, field_to_felt};
 use zkapi_crypto::pedersen::PedersenCommitment;
+#[cfg(feature = "dev-witness-envelope")]
 use zkapi_proof::verify_request_proof;
+use zkapi_proof::{ProofArtifact, ScarbStwoProver};
 use zkapi_types::wire::{
-    ApiRequest, ClearanceRequest, ClearanceResponse, CurvePointWire, RecoveryResponse,
-    RequestResponse,
+    ApiRequest, ClearanceRequest, ClearanceResponse, CurvePointWire, ProofBackendWire,
+    RecoveryResponse, RequestResponse,
 };
-use zkapi_types::{Felt252, NullifierStatus, STATEMENT_TYPE_REQUEST};
+use zkapi_types::{
+    canonical_payload_hash, canonical_response_hash, lookup_state_root, Felt252, NullifierStatus,
+    STATEMENT_TYPE_REQUEST,
+};
 
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, ServerProofMode};
 use crate::error::ServerError;
 use crate::nullifier_store::{NullifierStore, TranscriptRecord};
 use crate::provider::ApiProvider;
@@ -80,6 +85,12 @@ impl RequestProcessor {
         api_request: &ApiRequest,
     ) -> Result<RequestResponse, ServerError> {
         let pi = &api_request.public_inputs;
+        let actual_payload_hash = canonical_payload_hash(api_request.payload.as_bytes());
+        if api_request.payload_hash != actual_payload_hash {
+            return Err(ServerError::InvalidRequest(
+                "payload_hash does not match actual payload bytes".to_string(),
+            ));
+        }
 
         // Step 1: Validate protocol version
         if pi.protocol_version != self.config.protocol_version {
@@ -140,33 +151,32 @@ impl RequestProcessor {
             )));
         }
 
-        // Step 8: Verify state_sig_epoch/root consistency
-        // For genesis (epoch 0), state_sig_root should be zero
-        // For later states, epoch should match and root should match signer's root
-        if pi.state_sig_epoch != 0 && pi.state_sig_root != self.signer.state_root() {
-            return Err(ServerError::InvalidRequest(
-                "state_sig_root does not match server's state signing root".to_string(),
-            ));
-        }
+        // Step 8: Verify state_sig_epoch/root consistency. Non-genesis
+        // requests may reference any trusted published epoch, not only this
+        // process's current signing tree.
+        validate_state_sig_root(
+            &self.config,
+            &self.signer,
+            pi.state_sig_epoch,
+            pi.state_sig_root,
+        )?;
 
-        // Step 9: Verify the proof envelope against the stated public inputs.
-        let proof_bytes = base64::engine::general_purpose::STANDARD
-            .decode(api_request.proof_envelope.as_bytes())
-            .map_err(|e| ServerError::InvalidProof(format!("invalid base64 proof: {}", e)))?;
-        verify_request_proof(&proof_bytes, pi)
-            .map_err(|e| ServerError::InvalidProof(e.to_string()))?;
+        // Step 9: Verify the proof artifact against the stated public inputs.
+        let proof_bytes = self.verify_request_proof_artifact(api_request)?;
 
         // Step 10: Reserve nullifier in store
         match self.store.lookup_by_nullifier(&pi.request_nullifier) {
             Some(existing)
-                if existing.client_request_id.as_deref() == Some(&api_request.client_request_id)
+                if existing.client_request_id.as_deref()
+                    == Some(&api_request.client_request_id)
                     && existing.payload_hash == Some(api_request.payload_hash)
                     && existing.status == NullifierStatus::Finalized =>
             {
                 return build_response_from_record(&existing, &api_request.client_request_id);
             }
             Some(existing)
-                if existing.client_request_id.as_deref() == Some(&api_request.client_request_id)
+                if existing.client_request_id.as_deref()
+                    == Some(&api_request.client_request_id)
                     && existing.payload_hash == Some(api_request.payload_hash)
                     && existing.status == NullifierStatus::Reserved => {}
             Some(_) => return Err(ServerError::Replay),
@@ -185,7 +195,7 @@ impl RequestProcessor {
         )?;
         let response_code = provider_response.status_code;
         let response_payload = provider_response.payload;
-        let response_hash = provider_response.response_hash;
+        let response_hash = canonical_response_hash(response_payload.as_bytes());
         let charge = provider_response.charge_applied;
 
         // Step 12: Enforce the charge cap before signing a next state.
@@ -201,9 +211,6 @@ impl RequestProcessor {
             )));
         }
 
-        // Step 13: Sign next state to get the leaf index for anchor/blind derivation
-        // First we need to compute the next commitment, anchor, etc.
-        // We need a server RNG value for anchor and blind derivation.
         let server_rng = generate_server_rng(&pi.request_nullifier);
         let server_rng2 = generate_server_rng2(&pi.request_nullifier);
 
@@ -212,145 +219,38 @@ impl RequestProcessor {
         // next_commitment = anon_commitment - charge * G_balance + blind_delta * H_blind
         //
         // The anon_commitment comes from the proof's public inputs (anon_commitment_x, anon_commitment_y).
-        let anon_point = reconstruct_affine_point(
-            &pi.anon_commitment_x,
-            &pi.anon_commitment_y,
-        );
+        let anon_point = reconstruct_affine_point(&pi.anon_commitment_x, &pi.anon_commitment_y);
 
-        // We need to sign first to know the leaf_index for blind/anchor computation.
-        // We'll use a temporary message, then compute the real one.
-        // Actually, the spec says: compute anchor and blind using the sig leaf_index.
-        // We need to sign a preliminary message and the leaf_index determines anchor/blind.
-        // The state message depends on next_commitment and anchor, but anchor depends on leaf_index
-        // and next_commitment depends on blind_delta which depends on leaf_index.
-        // So we must get the leaf_index first by signing.
-
-        // Sign a placeholder to consume the leaf index; we build the real signature below.
-        // In the XMSS scheme the leaf_index is deterministic from the signer's counter,
-        // so we can pre-read it. But the API only exposes sign(). We sign the real message
-        // after we compute it.
-
-        // To break the circular dependency:
-        // 1. We know the signer will use the next available leaf_index.
-        // 2. Compute blind_delta using that index (from server_rng2, nullifier, index).
-        // 3. Compute next_commitment from anon_commitment, charge, blind_delta.
-        // 4. Compute next_anchor from server_rng, nullifier, next_commitment, index.
-        // 5. Compute state_message from next_commitment, next_anchor.
-        // 6. Sign the state_message (consuming the leaf index).
-
-        // The XMSS sign() consumes the index atomically, so we sign the final message.
-        // We need to predict the next leaf_index. For correctness we rely on the
-        // atomic counter inside XmssKeypair. We compute everything using the current
-        // "next" index, then sign -- if the index matches, great.
-
-        // For simplicity: sign the state message in one step.
-        // We compute blind_delta with a "predicted" leaf index = 0-based counter.
-        // But we don't expose the counter. Instead, we compute everything, sign,
-        // and verify the leaf_index matches.
-
-        // Actually, sign() returns (sig, leaf_index). We sign, then backfill anchor/blind.
-        // This means we need to compute anchor/blind after signing. But the state message
-        // depends on anchor, which depends on the leaf_index from signing.
-        // The solution: sign a "pre-image commitment" and use the returned leaf_index.
-
-        // Spec section 9.3 approach: the server signs the state message which includes
-        // the next_commitment and next_anchor. But next_anchor depends on the leaf_index.
-        // The spec resolves this by computing anchor/blind from the leaf_index, then
-        // building the message, then signing. The signer's sign() method is the only
-        // way to get the leaf_index, but it also consumes a key.
-        //
-        // We solve this with a two-phase approach: the sign() function returns the
-        // leaf_index used, so we compute everything with that index afterwards.
-        // However, we need the message before we can sign.
-        //
-        // Resolution: We pre-compute with a temporary leaf_index=0, then correct.
-        // OR we accept that the signer's sign method takes the message, and we must
-        // know the message before signing.
-        //
-        // The practical solution: we pre-compute blind_delta and anchor using an
-        // estimated leaf_index. Since we control the signer, we can peek at the next
-        // index. We'll add a helper for this.
-        //
-        // For now: use a simple approach -- compute blind_delta with leaf_index=0 placeholder,
-        // sign, get real leaf_index, then recompute if needed. In practice the server
-        // has exclusive access so the predicted index is reliable.
-
-        // Get blind_delta with the server_rng2
-        // We'll compute it without leaf_index first, then include leaf_index after signing.
-        // Actually: let's just sign a dummy, get the index, compute everything, then
-        // construct the response. The signature is over the state message which includes
-        // the final commitment and anchor. We need the right message.
-
-        // Final approach: compute blind and anchor first using a preliminary sign to get
-        // the leaf index, but since the XMSS sign consumes the leaf, we do this:
-        // 1. Sign the state message. But we need anchor for the message...
-        //
-        // The spec's actual flow is:
-        //   leaf_index is implicitly the next counter value.
-        //   blind_delta = Poseidon(DOMAIN_BLIND, rng2, nullifier, leaf_index)
-        //   next_commitment = update(anon, charge, blind_delta)
-        //   next_anchor = Poseidon(DOMAIN_ANCHOR, rng, nullifier, cx', cy', leaf_index)
-        //   m_state = Poseidon(DOMAIN_STATE, version, chain_id, addr, cx', cy', anchor')
-        //   sig = XMSS_sign(m_state) -- uses leaf_index internally
-        //
-        // So we need to know leaf_index before signing. We'll read it from the signer.
-        // Since the signer's sign() atomically increments, we need to compute everything
-        // before calling sign(). We can get the next index from remaining() math,
-        // but that's fragile. Let's just sign and accept the leaf_index from the result.
-        //
-        // To handle this correctly: compute the state message as a function of leaf_index,
-        // then call sign with that message. We get leaf_index from the sign result and
-        // verify it matches our prediction.
-        //
-        // Prediction: ask the signer for the next leaf index directly.
-        let predicted_leaf_index = self.signer.state_next_index();
-
-        // Step 13: Compute blind_delta
-        let blind_delta_felt = compute_blind_delta(
-            &server_rng2,
-            &pi.request_nullifier,
-            predicted_leaf_index,
-        );
-        let blind_delta_field = felt_to_field(&blind_delta_felt);
-
-        // Step 15: Compute next_commitment homomorphically
-        let updated =
-            PedersenCommitment::server_update(&anon_point, charge, &blind_delta_field);
-        let (next_cx_field, next_cy_field) = updated.to_affine();
-        let next_cx = field_to_felt(&next_cx_field);
-        let next_cy = field_to_felt(&next_cy_field);
-
-        // Step 13 (cont): Compute next_anchor
-        let next_anchor = compute_next_anchor(
-            &server_rng,
-            &pi.request_nullifier,
-            &next_cx,
-            &next_cy,
-            predicted_leaf_index,
-        );
-
-        // Step 16: Compute state message and sign
-        let state_msg = compute_state_message(
-            self.config.protocol_version,
-            self.config.chain_id,
-            &self.config.contract_address,
-            &next_cx,
-            &next_cy,
-            &next_anchor,
-        );
-
-        let (state_sig, actual_leaf_index) = self.signer.sign_state(&state_msg)?;
-
-        // Verify our predicted index was correct
-        if actual_leaf_index != predicted_leaf_index {
-            // This shouldn't happen in single-threaded processing but if it does,
-            // we'd need to recompute. For now, log and proceed with a warning.
-            tracing::warn!(
-                "leaf_index mismatch: predicted={}, actual={}",
-                predicted_leaf_index,
-                actual_leaf_index
+        let mut signed_state: Option<(Felt252, Felt252, Felt252, Felt252)> = None;
+        let (state_sig, _leaf_index, _state_msg) = self.signer.sign_next_state(|leaf_index| {
+            let blind_delta_felt =
+                compute_blind_delta(&server_rng2, &pi.request_nullifier, leaf_index);
+            let blind_delta_field = felt_to_field(&blind_delta_felt);
+            let updated =
+                PedersenCommitment::server_update(&anon_point, charge, &blind_delta_field);
+            let (next_cx_field, next_cy_field) = updated.to_affine();
+            let next_cx = field_to_felt(&next_cx_field);
+            let next_cy = field_to_felt(&next_cy_field);
+            let next_anchor = compute_next_anchor(
+                &server_rng,
+                &pi.request_nullifier,
+                &next_cx,
+                &next_cy,
+                leaf_index,
             );
-        }
+            let state_msg = compute_state_message(
+                self.config.protocol_version,
+                self.config.chain_id,
+                &self.config.contract_address,
+                &next_cx,
+                &next_cy,
+                &next_anchor,
+            );
+            signed_state = Some((next_cx, next_cy, next_anchor, blind_delta_felt));
+            state_msg
+        })?;
+        let (next_cx, next_cy, next_anchor, blind_delta_felt) = signed_state
+            .ok_or_else(|| ServerError::Internal("signer did not build state".to_string()))?;
 
         // Step 17: Finalize transcript
         let transcript = TranscriptRecord {
@@ -360,6 +260,7 @@ impl RequestProcessor {
             payload_hash: Some(api_request.payload_hash),
             charge_applied: Some(charge),
             response_code: Some(response_code),
+            response_payload: Some(response_payload.clone()),
             response_hash: Some(response_hash),
             next_commitment_x: Some(next_cx),
             next_commitment_y: Some(next_cy),
@@ -378,9 +279,7 @@ impl RequestProcessor {
 
         self.store
             .finalize(&pi.request_nullifier, &transcript)
-            .map_err(|e| {
-                ServerError::Internal(format!("failed to finalize transcript: {}", e))
-            })?;
+            .map_err(|e| ServerError::Internal(format!("failed to finalize transcript: {}", e)))?;
 
         // Step 18: Return response
         Ok(RequestResponse {
@@ -403,6 +302,45 @@ impl RequestProcessor {
             policy_reason_code: provider_response.policy_reason_code,
             policy_evidence_hash: provider_response.policy_evidence_hash,
         })
+    }
+
+    fn verify_request_proof_artifact(
+        &self,
+        api_request: &ApiRequest,
+    ) -> Result<Vec<u8>, ServerError> {
+        let pi = &api_request.public_inputs;
+        let artifact = &api_request.proof;
+        if artifact.backend != ProofBackendWire::StwoCairo {
+            return Err(ServerError::InvalidProof(
+                "unsupported proof backend".to_string(),
+            ));
+        }
+        let expected_hash = pi.public_output_hash();
+        if artifact.public_output_hash != expected_hash {
+            return Err(ServerError::InvalidProof(
+                "proof public_output_hash does not match request public inputs".to_string(),
+            ));
+        }
+        let proof_bytes = base64::engine::general_purpose::STANDARD
+            .decode(artifact.proof.as_bytes())
+            .map_err(|e| ServerError::InvalidProof(format!("invalid base64 proof: {}", e)))?;
+
+        match &self.config.proof_mode {
+            ServerProofMode::StwoScarb { cairo_dir } => {
+                let proof_artifact =
+                    ProofArtifact::stwo_cairo(artifact.public_output_hash, proof_bytes.clone());
+                ScarbStwoProver::new(cairo_dir)
+                    .verify_artifact(&proof_artifact)
+                    .map_err(|e| ServerError::InvalidProof(e.to_string()))?;
+            }
+            #[cfg(feature = "dev-witness-envelope")]
+            ServerProofMode::DevWitnessEnvelope => {
+                verify_request_proof(&proof_bytes, pi)
+                    .map_err(|e| ServerError::InvalidProof(e.to_string()))?;
+            }
+        }
+
+        Ok(proof_bytes)
     }
 
     /// Process a clearance request for mutual close.
@@ -494,7 +432,7 @@ fn build_response_from_record(
         client_request_id: client_request_id.to_string(),
         request_nullifier: record.nullifier,
         response_code: record.response_code.unwrap_or(200),
-        response_payload: String::new(),
+        response_payload: record.response_payload.clone().unwrap_or_default(),
         response_hash: record.response_hash.unwrap_or(Felt252::ZERO),
         charge_applied: record.charge_applied.unwrap_or(0),
         next_commitment: CurvePointWire {
@@ -505,10 +443,7 @@ fn build_response_from_record(
         blind_delta_srv: record.blind_delta_srv.unwrap_or(Felt252::ZERO),
         next_state_sig_epoch: record.next_state_sig_epoch.unwrap_or(0),
         next_state_sig_root: record.next_state_sig_root.unwrap_or(Felt252::ZERO),
-        next_state_sig: record
-            .next_state_sig
-            .clone()
-            .unwrap_or_else(empty_xmss_sig),
+        next_state_sig: record.next_state_sig.clone().unwrap_or_else(empty_xmss_sig),
         policy_reason_code: record.policy_reason_code,
         policy_evidence_hash: record.policy_evidence_hash,
     })
@@ -523,10 +458,7 @@ fn build_recovery_response(record: &TranscriptRecord) -> RecoveryResponse {
     };
 
     let request_response = if record.status == NullifierStatus::Finalized {
-        let client_id = record
-            .client_request_id
-            .clone()
-            .unwrap_or_default();
+        let client_id = record.client_request_id.clone().unwrap_or_default();
         build_response_from_record(record, &client_id).ok()
     } else {
         None
@@ -540,11 +472,43 @@ fn build_recovery_response(record: &TranscriptRecord) -> RecoveryResponse {
 }
 
 /// Reconstruct an affine point from x,y Felt252 coordinates into a ProjectivePoint.
-fn reconstruct_affine_point(x: &Felt252, y: &Felt252) -> starknet_types_core::curve::ProjectivePoint {
+fn reconstruct_affine_point(
+    x: &Felt252,
+    y: &Felt252,
+) -> starknet_types_core::curve::ProjectivePoint {
     let x_field = felt_to_field(x);
     let y_field = felt_to_field(y);
     starknet_types_core::curve::ProjectivePoint::from_affine(x_field, y_field)
         .expect("invalid affine point")
+}
+
+fn validate_state_sig_root(
+    config: &ServerConfig,
+    signer: &ServerSigner,
+    epoch: u32,
+    root: Felt252,
+) -> Result<(), ServerError> {
+    if epoch == 0 {
+        if !root.is_zero() {
+            return Err(ServerError::InvalidRequest(
+                "genesis state_sig_root must be zero".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    if root == signer.state_root() {
+        return Ok(());
+    }
+
+    let trusted = lookup_state_root(&config.trusted_epoch_roots, epoch);
+    if trusted == Some(root) {
+        return Ok(());
+    }
+
+    Err(ServerError::InvalidRequest(
+        "state_sig_root is not trusted for state_sig_epoch".to_string(),
+    ))
 }
 
 /// Generate a deterministic server RNG value from the nullifier (for anchor derivation).
@@ -578,4 +542,261 @@ fn current_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use zkapi_core::leaf::{compute_note_leaf, compute_registration_commitment};
+    use zkapi_core::merkle::MerkleTree;
+    use zkapi_core::poseidon::FieldElement;
+    use zkapi_proof::{RequestProofBuilder, ScarbStwoProver};
+    use zkapi_types::wire::{ProofArtifactWire, ProofBackendWire};
+    use zkapi_types::EpochRoots;
+
+    fn processor_config(trusted_epoch_roots: Vec<EpochRoots>) -> ServerConfig {
+        ServerConfig {
+            protocol_version: 1,
+            chain_id: 1,
+            contract_address: Felt252::from_u64(0xdead),
+            request_charge_cap: 100,
+            policy_charge_cap: 100,
+            policy_enabled: false,
+            trusted_epoch_roots,
+            ..ServerConfig::default()
+        }
+    }
+
+    fn signer(epoch: u32) -> Arc<ServerSigner> {
+        Arc::new(ServerSigner::with_height(
+            FieldElement::from(777u64),
+            FieldElement::from(888u64),
+            epoch,
+            4,
+        ))
+    }
+
+    fn request_processor(config: ServerConfig) -> RequestProcessor {
+        RequestProcessor::new(
+            config,
+            Arc::new(NullifierStore::in_memory().unwrap()),
+            signer(1),
+            Arc::new(crate::provider::EchoProvider::default()),
+            Felt252::from_u64(11),
+        )
+    }
+
+    fn cairo_dir() -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../cairo")
+            .canonicalize()
+            .unwrap_or_else(|_| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../cairo")
+            })
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[test]
+    fn state_sig_root_validation_accepts_trusted_prior_epoch_root() {
+        let prior_root = Felt252::from_u64(0xabc);
+        let signer = signer(2);
+        let config = processor_config(vec![EpochRoots {
+            epoch: 1,
+            state_root: prior_root,
+            clear_root: Felt252::from_u64(0xc1ea),
+        }]);
+
+        validate_state_sig_root(&config, &signer, 1, prior_root).unwrap();
+    }
+
+    #[test]
+    fn state_sig_root_validation_rejects_unknown_prior_epoch_root() {
+        let config = processor_config(Vec::new());
+        let signer = signer(2);
+
+        let err =
+            validate_state_sig_root(&config, &signer, 1, Felt252::from_u64(0xabc)).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest(msg) if msg.contains("not trusted")));
+    }
+
+    #[test]
+    fn state_sig_root_validation_rejects_nonzero_genesis_root() {
+        let config = processor_config(Vec::new());
+        let signer = signer(2);
+
+        let err =
+            validate_state_sig_root(&config, &signer, 0, Felt252::from_u64(0xabc)).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest(msg) if msg.contains("genesis")));
+    }
+
+    #[test]
+    fn proof_artifact_rejects_public_output_hash_mismatch() {
+        let processor = request_processor(processor_config(Vec::new()));
+        let public_inputs = zkapi_types::RequestPublicInputs {
+            statement_type: zkapi_types::STATEMENT_TYPE_REQUEST,
+            protocol_version: 1,
+            chain_id: 1,
+            contract_address: Felt252::from_u64(0xdead),
+            active_root: Felt252::from_u64(11),
+            state_sig_epoch: 0,
+            state_sig_root: Felt252::ZERO,
+            request_nullifier: Felt252::from_u64(99),
+            anon_commitment_x: Felt252::from_u64(1),
+            anon_commitment_y: Felt252::from_u64(2),
+            expiry_ts: 2_000_000_000,
+            solvency_bound: 100,
+        };
+        let request = ApiRequest {
+            client_request_id: "req-1".to_string(),
+            payload: "payload".to_string(),
+            payload_hash: zkapi_types::canonical_payload_hash(b"payload"),
+            public_inputs,
+            proof: ProofArtifactWire {
+                backend: ProofBackendWire::StwoCairo,
+                public_output_hash: Felt252::from_u64(0xbad),
+                proof: base64::engine::general_purpose::STANDARD.encode(b"not a proof"),
+            },
+        };
+
+        let err = processor
+            .verify_request_proof_artifact(&request)
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::InvalidProof(msg) if msg.contains("public_output_hash"))
+        );
+    }
+
+    #[test]
+    fn proof_artifact_rejects_tampered_stwo_proof_bytes() {
+        let mut config = processor_config(Vec::new());
+        config.proof_mode = ServerProofMode::StwoScarb {
+            cairo_dir: cairo_dir(),
+        };
+        let processor = request_processor(config);
+        let public_inputs = zkapi_types::RequestPublicInputs {
+            statement_type: zkapi_types::STATEMENT_TYPE_REQUEST,
+            protocol_version: 1,
+            chain_id: 1,
+            contract_address: Felt252::from_u64(0xdead),
+            active_root: Felt252::from_u64(11),
+            state_sig_epoch: 0,
+            state_sig_root: Felt252::ZERO,
+            request_nullifier: Felt252::from_u64(99),
+            anon_commitment_x: Felt252::from_u64(1),
+            anon_commitment_y: Felt252::from_u64(2),
+            expiry_ts: 2_000_000_000,
+            solvency_bound: 100,
+        };
+        let request = ApiRequest {
+            client_request_id: "req-1".to_string(),
+            payload: "payload".to_string(),
+            payload_hash: zkapi_types::canonical_payload_hash(b"payload"),
+            proof: ProofArtifactWire {
+                backend: ProofBackendWire::StwoCairo,
+                public_output_hash: public_inputs.public_output_hash(),
+                proof: base64::engine::general_purpose::STANDARD.encode(b"not a proof"),
+            },
+            public_inputs,
+        };
+
+        let err = processor
+            .verify_request_proof_artifact(&request)
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::InvalidProof(msg) if msg.contains("scarb command failed"))
+        );
+    }
+
+    #[test]
+    fn process_request_accepts_real_stwo_request_artifact() {
+        let secret = Felt252::from_u64(42);
+        let note_id = 0;
+        let deposit = 1_000u128;
+        let expiry = 4_000_000_000u64;
+        let commitment = compute_registration_commitment(&secret);
+        let leaf = compute_note_leaf(note_id, &commitment, deposit, expiry);
+        let mut tree = MerkleTree::new();
+        tree.insert(leaf);
+        let active_root = tree.root();
+        let siblings = tree.get_siblings(note_id);
+
+        let mut config = processor_config(Vec::new());
+        config.initial_root = active_root;
+        config.proof_mode = ServerProofMode::StwoScarb {
+            cairo_dir: cairo_dir(),
+        };
+        let store = Arc::new(NullifierStore::in_memory().unwrap());
+        let processor = RequestProcessor::new(
+            config.clone(),
+            store.clone(),
+            signer(1),
+            Arc::new(crate::provider::EchoProvider::default()),
+            active_root,
+        );
+
+        let builder = RequestProofBuilder::new(
+            secret,
+            note_id,
+            deposit,
+            expiry,
+            siblings,
+            deposit,
+            FieldElement::ZERO,
+            FieldElement::from(7u64),
+            Felt252::ONE,
+            true,
+            0,
+            Felt252::ZERO,
+            active_root,
+            config.protocol_version,
+            config.chain_id,
+            config.contract_address,
+            config.request_charge_cap,
+        );
+        let public_inputs = builder.build_public_inputs().unwrap();
+        let artifact = ScarbStwoProver::new(cairo_dir())
+            .prove_and_verify_executable_with_args(
+                "request_from_args",
+                public_inputs.public_output_hash(),
+                &builder.to_cairo_args(None).unwrap(),
+            )
+            .unwrap();
+        let request = ApiRequest {
+            client_request_id: "req-real-proof".to_string(),
+            payload: "payload".to_string(),
+            payload_hash: zkapi_types::canonical_payload_hash(b"payload"),
+            public_inputs,
+            proof: ProofArtifactWire {
+                backend: ProofBackendWire::StwoCairo,
+                public_output_hash: artifact.public_output_hash,
+                proof: base64::engine::general_purpose::STANDARD.encode(artifact.proof),
+            },
+        };
+
+        let response = processor.process_request(&request).unwrap();
+        assert_eq!(response.status, "ok");
+        assert_eq!(response.response_payload, "payload");
+        assert_eq!(response.charge_applied, 1);
+
+        let recovery = processor
+            .recover_by_client_id("req-real-proof")
+            .expect("recovery should read finalized transcript");
+        assert_eq!(recovery.nullifier_status, "finalized");
+        assert!(recovery.request_response.is_some());
+
+        let action = crate::watcher::ChallengeWatcher::new(store)
+            .build_challenge_action(
+                note_id,
+                &request.public_inputs.request_nullifier,
+                [Felt252::ZERO; zkapi_types::MERKLE_DEPTH],
+            )
+            .expect("challenge watcher should archive real proof artifact");
+        assert_eq!(
+            action.request_inputs.request_nullifier,
+            request.public_inputs.request_nullifier
+        );
+        assert!(!action.proof_artifact.is_empty());
+    }
 }

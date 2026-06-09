@@ -5,12 +5,18 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+dev-witness-envelope = []
+test-utils = ["dev-witness-envelope"]
+
 [dependencies]
 zkapi-types  = { workspace = true }
 zkapi-core   = { workspace = true }
 zkapi-crypto = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
+serde_bytes  = "0.11"
 hex          = { workspace = true }
 sha3         = { workspace = true }
 thiserror       = { workspace = true }

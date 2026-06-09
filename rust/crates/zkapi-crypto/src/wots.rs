@@ -132,8 +132,7 @@ pub fn wots_verify(
     }
     for i in 0..WOTS_LEN2 {
         let remaining = (WOTS_W as u32 - 1) - cs_digits[i];
-        recovered_pk[WOTS_LEN1 + i] =
-            chain(&signature[WOTS_LEN1 + i], cs_digits[i], remaining);
+        recovered_pk[WOTS_LEN1 + i] = chain(&signature[WOTS_LEN1 + i], cs_digits[i], remaining);
     }
 
     recovered_pk

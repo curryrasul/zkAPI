@@ -21,6 +21,7 @@ pub struct TranscriptRecord {
     pub payload_hash: Option<Felt252>,
     pub charge_applied: Option<u128>,
     pub response_code: Option<u16>,
+    pub response_payload: Option<String>,
     pub response_hash: Option<Felt252>,
     pub next_commitment_x: Option<Felt252>,
     pub next_commitment_y: Option<Felt252>,
@@ -56,6 +57,7 @@ impl NullifierStore {
                 payload_hash TEXT,
                 charge_applied INTEGER,
                 response_code INTEGER,
+                response_payload TEXT,
                 response_hash TEXT,
                 next_commitment_x TEXT,
                 next_commitment_y TEXT,
@@ -78,6 +80,10 @@ impl NullifierStore {
             "ALTER TABLE nullifiers ADD COLUMN next_state_sig_root TEXT",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE nullifiers ADD COLUMN response_payload TEXT",
+            [],
+        );
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -97,9 +103,10 @@ impl NullifierStore {
         client_request_id: &str,
         payload_hash: &Felt252,
     ) -> Result<(), ServerError> {
-        let conn = self.conn.lock().map_err(|e| {
-            ServerError::Database(format!("lock poisoned: {}", e))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {}", e)))?;
         let now = current_timestamp();
         let null_hex = nullifier.to_hex();
 
@@ -132,9 +139,10 @@ impl NullifierStore {
         nullifier: &Felt252,
         transcript: &TranscriptRecord,
     ) -> Result<(), ServerError> {
-        let conn = self.conn.lock().map_err(|e| {
-            ServerError::Database(format!("lock poisoned: {}", e))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {}", e)))?;
         let now = current_timestamp();
         let null_hex = nullifier.to_hex();
 
@@ -149,24 +157,26 @@ impl NullifierStore {
                     status = ?1,
                     charge_applied = ?2,
                     response_code = ?3,
-                    response_hash = ?4,
-                    next_commitment_x = ?5,
-                    next_commitment_y = ?6,
-                    next_anchor = ?7,
-                    blind_delta_srv = ?8,
-                    next_state_sig_epoch = ?9,
-                    next_state_sig_root = ?10,
-                    next_state_sig_json = ?11,
-                    policy_reason_code = ?12,
-                    policy_evidence_hash = ?13,
-                    proof_blob = ?14,
-                    request_inputs_json = ?15,
-                    finalized_at = ?16
-                 WHERE nullifier = ?17 AND status = ?18",
+                    response_payload = ?4,
+                    response_hash = ?5,
+                    next_commitment_x = ?6,
+                    next_commitment_y = ?7,
+                    next_anchor = ?8,
+                    blind_delta_srv = ?9,
+                    next_state_sig_epoch = ?10,
+                    next_state_sig_root = ?11,
+                    next_state_sig_json = ?12,
+                    policy_reason_code = ?13,
+                    policy_evidence_hash = ?14,
+                    proof_blob = ?15,
+                    request_inputs_json = ?16,
+                    finalized_at = ?17
+                 WHERE nullifier = ?18 AND status = ?19",
                 params![
                     status_to_str(NullifierStatus::Finalized),
                     transcript.charge_applied.map(|c| c as i64),
                     transcript.response_code.map(|c| c as i32),
+                    transcript.response_payload.as_deref(),
                     transcript.response_hash.map(|h| h.to_hex()),
                     transcript.next_commitment_x.map(|c| c.to_hex()),
                     transcript.next_commitment_y.map(|c| c.to_hex()),
@@ -226,9 +236,10 @@ impl NullifierStore {
 
     /// Reserve a nullifier for clearance (withdrawal signing).
     pub fn reserve_clearance(&self, nullifier: &Felt252) -> Result<(), ServerError> {
-        let conn = self.conn.lock().map_err(|e| {
-            ServerError::Database(format!("lock poisoned: {}", e))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ServerError::Database(format!("lock poisoned: {}", e)))?;
         let now = current_timestamp();
         let null_hex = nullifier.to_hex();
 
@@ -260,9 +271,7 @@ impl NullifierStore {
             Err(_) => return Vec::new(),
         };
 
-        let mut stmt = match conn.prepare(
-            "SELECT * FROM nullifiers WHERE status = ?1",
-        ) {
+        let mut stmt = match conn.prepare("SELECT * FROM nullifiers WHERE status = ?1") {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -331,6 +340,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRecord> 
     let payload_hash: Option<String> = row.get("payload_hash")?;
     let charge_applied: Option<i64> = row.get("charge_applied")?;
     let response_code: Option<i32> = row.get("response_code")?;
+    let response_payload: Option<String> = row.get("response_payload").ok();
     let response_hash: Option<String> = row.get("response_hash")?;
     let next_commitment_x: Option<String> = row.get("next_commitment_x")?;
     let next_commitment_y: Option<String> = row.get("next_commitment_y")?;
@@ -346,8 +356,8 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRecord> 
     let created_at: i64 = row.get("created_at")?;
     let finalized_at: Option<i64> = row.get("finalized_at")?;
 
-    let next_state_sig = next_state_sig_json
-        .and_then(|json| serde_json::from_str::<XmssSignature>(&json).ok());
+    let next_state_sig =
+        next_state_sig_json.and_then(|json| serde_json::from_str::<XmssSignature>(&json).ok());
 
     Ok(TranscriptRecord {
         nullifier: Felt252::from_hex(&nullifier_hex).unwrap_or(Felt252::ZERO),
@@ -356,6 +366,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRecord> 
         payload_hash: parse_opt_felt(payload_hash),
         charge_applied: charge_applied.map(|c| c as u128),
         response_code: response_code.map(|c| c as u16),
+        response_payload,
         response_hash: parse_opt_felt(response_hash),
         next_commitment_x: parse_opt_felt(next_commitment_x),
         next_commitment_y: parse_opt_felt(next_commitment_y),
@@ -404,7 +415,9 @@ mod tests {
         let store = NullifierStore::in_memory().unwrap();
         let nullifier = Felt252::from_u64(42);
 
-        store.reserve(&nullifier, "req-1", &Felt252::from_u64(1)).unwrap();
+        store
+            .reserve(&nullifier, "req-1", &Felt252::from_u64(1))
+            .unwrap();
         let result = store.reserve(&nullifier, "req-2", &Felt252::from_u64(2));
         assert!(result.is_err());
     }
@@ -415,7 +428,9 @@ mod tests {
         let nullifier = Felt252::from_u64(42);
         let client_id = "unique-client-id";
 
-        store.reserve(&nullifier, client_id, &Felt252::from_u64(1)).unwrap();
+        store
+            .reserve(&nullifier, client_id, &Felt252::from_u64(1))
+            .unwrap();
 
         let record = store.lookup_by_client_id(client_id).unwrap();
         assert_eq!(record.nullifier, nullifier);
@@ -426,7 +441,9 @@ mod tests {
         let store = NullifierStore::in_memory().unwrap();
         let nullifier = Felt252::from_u64(42);
 
-        store.reserve(&nullifier, "req-1", &Felt252::from_u64(1)).unwrap();
+        store
+            .reserve(&nullifier, "req-1", &Felt252::from_u64(1))
+            .unwrap();
 
         let transcript = TranscriptRecord {
             nullifier,
@@ -435,6 +452,7 @@ mod tests {
             payload_hash: Some(Felt252::from_u64(1)),
             charge_applied: Some(100),
             response_code: Some(200),
+            response_payload: Some("ok".to_string()),
             response_hash: Some(Felt252::from_u64(999)),
             next_commitment_x: Some(Felt252::from_u64(10)),
             next_commitment_y: Some(Felt252::from_u64(20)),
@@ -473,8 +491,12 @@ mod tests {
     fn test_get_reserved_entries() {
         let store = NullifierStore::in_memory().unwrap();
 
-        store.reserve(&Felt252::from_u64(1), "r1", &Felt252::from_u64(10)).unwrap();
-        store.reserve(&Felt252::from_u64(2), "r2", &Felt252::from_u64(20)).unwrap();
+        store
+            .reserve(&Felt252::from_u64(1), "r1", &Felt252::from_u64(10))
+            .unwrap();
+        store
+            .reserve(&Felt252::from_u64(2), "r2", &Felt252::from_u64(20))
+            .unwrap();
 
         let reserved = store.get_reserved_entries();
         assert_eq!(reserved.len(), 2);
